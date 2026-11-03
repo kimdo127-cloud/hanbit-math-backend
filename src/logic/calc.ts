@@ -138,17 +138,38 @@ export interface PaymentRow {
   month: string;
   amount: number; // 청구 금액 (계산)
   discount: boolean;
+  partial: { count: number; total: number } | null; // 달 중간에 시작: 남은 수업 수만큼만 청구
   paidAmount: number | null;
   paidAt: string | null;
   status: "paid" | "unpaid" | "upcoming"; // upcoming: 아직 오지 않은 달
 }
 
+// 첫 달 수강료: 달 중간에 시작하면 그달 수업 수 중 남은 수업 수만큼만 (회차 기준, 10원 단위 버림)
+// 환불도 회차 기준(학원법)이라 들어올 때와 나갈 때 기준을 맞춘다
+function firstMonthShare(db: DB, classId: number, startDate: string, month: string) {
+  const { start, end } = monthRange(month);
+  const sessions = db.class_sessions.filter((x) => x.class_id === classId && x.date >= start && x.date <= end);
+  const count = sessions.filter((x) => x.date >= startDate).length;
+  return { count, total: sessions.length };
+}
+
 export function paymentRows(db: DB, student: Student, month: string): PaymentRow[] {
-  return enrollmentsInMonth(db, student.id, month).map((e) => {
+  return enrollmentsInMonth(db, student.id, month).flatMap((e): PaymentRow[] => {
     const cls = db.classes.find((c) => c.id === e.class_id)!;
-    const { amount, discount } = feeFor(db, student, cls, month);
+    const fee = feeFor(db, student, cls, month);
+    const { discount } = fee;
+    let amount = fee.amount;
+    let partial: PaymentRow["partial"] = null;
+    if (e.start_date.slice(0, 7) === month) {
+      const share = firstMonthShare(db, cls.id, e.start_date, month);
+      if (share.count === 0) return []; // 그달 수업이 없으면 청구 없음
+      if (share.count < share.total) {
+        partial = share;
+        amount = Math.floor((amount * share.count) / share.total / 10) * 10;
+      }
+    }
     const p = db.payments.find((x) => x.student_id === student.id && x.class_id === cls.id && x.month === month);
-    return {
+    return [{
       studentId: student.id,
       studentName: student.name,
       classId: cls.id,
@@ -156,9 +177,10 @@ export function paymentRows(db: DB, student: Student, month: string): PaymentRow
       month,
       amount,
       discount,
+      partial,
       paidAmount: p?.paid_amount ?? null,
       paidAt: p?.paid_at ?? null,
-      status: p?.paid_at ? "paid" : month > currentMonth() ? "upcoming" : "unpaid",
-    };
+      status: p?.paid_at ? ("paid" as const) : month > currentMonth() ? ("upcoming" as const) : ("unpaid" as const),
+    }];
   });
 }
