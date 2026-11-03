@@ -20,9 +20,25 @@ export const TABLES: (keyof DB)[] = [
   "activity_logs",
 ];
 
+// 시각(time)·일시(timestamp) 칸은 화면 코드가 쓰는 모양("17:00", "2026-10-29T16:50")으로 맞춘다
+const TIME_COLS = new Set(["start_time", "end_time", "checked_at"]);
+const TS_COLS: Record<string, string[]> = { staff_tokens: ["created_at", "expires_at", "used_at"], makeups: ["requested_at"], activity_logs: ["at"] };
+
+// 표 14개를 왕복 한 번에 읽는다 (원격 DB에서 표마다 따로 읽으면 느리다)
 export async function loadAll(client: PoolClient): Promise<DB> {
-  const db = {} as Record<string, unknown[]>;
-  for (const t of TABLES) db[t] = (await client.query(`SELECT * FROM ${t} ORDER BY id`)).rows;
+  const parts = TABLES.map((t) => `'${t}', (SELECT coalesce(json_agg(x ORDER BY x.id), '[]'::json) FROM ${t} x)`).join(", ");
+  const { rows } = await client.query(`SELECT json_build_object(${parts}) AS db`);
+  const db = rows[0].db as Record<string, Record<string, unknown>[]>;
+  for (const t of TABLES) {
+    for (const r of db[t]) {
+      for (const c of Object.keys(r)) {
+        const v = r[c];
+        if (typeof v !== "string") continue;
+        if (TIME_COLS.has(c)) r[c] = v.slice(0, 5);
+        else if (TS_COLS[t]?.includes(c)) r[c] = v.slice(0, 16);
+      }
+    }
+  }
   return db as unknown as DB;
 }
 
@@ -54,6 +70,17 @@ export async function syncChanges(client: PoolClient, before: DB, after: DB) {
   for (const [t, ids] of deletes.reverse()) await client.query(`DELETE FROM ${t} WHERE id = ANY($1)`, [ids]);
 }
 
+// 시연 데이터 넣기: 여러 줄을 한 번에 (원격 DB에 줄마다 보내면 몇 분 걸린다)
 export async function insertAll(client: PoolClient, db: DB) {
-  for (const t of TABLES) for (const r of db[t] as unknown as Row[]) await insert(client, t, r);
+  for (const t of TABLES) {
+    const rows = db[t] as unknown as Row[];
+    if (!rows.length) continue;
+    const cols = Object.keys(rows[0]);
+    const per = Math.max(1, Math.floor(60000 / cols.length)); // PostgreSQL 파라미터 한도 안에서
+    for (let i = 0; i < rows.length; i += per) {
+      const chunk = rows.slice(i, i + per);
+      const values = chunk.map((_, r) => `(${cols.map((_, c) => `$${r * cols.length + c + 1}`).join(",")})`).join(",");
+      await client.query(`INSERT INTO ${t} (${cols.join(",")}) VALUES ${values}`, chunk.flatMap((r) => cols.map((c) => r[c] ?? null)));
+    }
+  }
 }
