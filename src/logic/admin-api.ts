@@ -514,7 +514,7 @@ export async function getAttendanceSheet(classId: number, date: string) {
   const session = db.class_sessions.find((s) => s.class_id === classId && s.date === date);
   if (!session) throw new ApiError("이 날은 수업이 없어요.", 404);
   const rows: SheetRow[] = db.enrollments
-    .filter((e) => e.class_id === classId && e.start_date <= date && (e.end_date === null || e.end_date >= date))
+    .filter((e) => e.class_id === classId && e.start_date <= date && (e.end_date === null || e.end_date > date))
     .map((e) => {
       const s = db.students.find((x) => x.id === e.student_id)!;
       const a = db.attendances.find((x) => x.session_id === session.id && x.student_id === s.id);
@@ -588,7 +588,7 @@ function timeOf(db: DB, classId: number, date: string) {
 function sessionHeadcount(db: DB, sessionId: number) {
   const sess = db.class_sessions.find((s) => s.id === sessionId)!;
   const regular = db.enrollments.filter(
-    (e) => e.class_id === sess.class_id && e.start_date <= sess.date && (e.end_date === null || e.end_date >= sess.date),
+    (e) => e.class_id === sess.class_id && e.start_date <= sess.date && (e.end_date === null || e.end_date > sess.date),
   ).length;
   const makeups = db.makeups.filter((m) => m.session_id === sessionId).length;
   return { regular, makeups };
@@ -743,7 +743,7 @@ function refundCalc(db: DB, e: { student_id: number; class_id: number; start_dat
   const month = e.end_date.slice(0, 7);
   const { start, end } = monthRange(month);
   const sessions = db.class_sessions.filter((x) => x.class_id === e.class_id && x.date >= start && x.date <= end && x.date >= e.start_date);
-  const done = sessions.filter((x) => x.date <= e.end_date).length;
+  const done = sessions.filter((x) => x.date < e.end_date).length; // 중단일부터는 수업을 듣지 않는다
   const total = sessions.length;
   const ratio = total === 0 || done === 0 ? 1 : done < total / 3 ? 2 / 3 : done < total / 2 ? 1 / 2 : 0;
   const pay = db.payments.find((p) => p.student_id === e.student_id && p.class_id === e.class_id && p.month === month && p.paid_at);
@@ -827,7 +827,7 @@ export async function getDashboard() {
     .map(({ s, c }) => {
       const sess = db.class_sessions.find((x) => x.class_id === c.id && x.date === TODAY);
       const atts = sess ? db.attendances.filter((a) => a.session_id === sess.id) : [];
-      const expected = sess ? db.enrollments.filter((e) => e.class_id === c.id && e.start_date <= TODAY && (e.end_date === null || e.end_date >= TODAY)).length : 0;
+      const expected = sess ? db.enrollments.filter((e) => e.class_id === c.id && e.start_date <= TODAY && (e.end_date === null || e.end_date > TODAY)).length : 0;
       const makeupIn = sess ? db.makeups.filter((m) => m.session_id === sess.id).length : 0;
       return {
         classId: c.id,
@@ -882,7 +882,7 @@ export interface KioskCandidate {
 
 function todaySessionsFor(db: DB, studentId: number) {
   const regular = db.enrollments
-    .filter((e) => e.student_id === studentId && e.start_date <= TODAY && (e.end_date === null || e.end_date >= TODAY))
+    .filter((e) => e.student_id === studentId && e.start_date <= TODAY && (e.end_date === null || e.end_date > TODAY))
     .map((e) => db.class_sessions.find((x) => x.class_id === e.class_id && x.date === TODAY))
     .filter((x): x is NonNullable<typeof x> => !!x)
     .map((x) => ({ x, makeup: false }));

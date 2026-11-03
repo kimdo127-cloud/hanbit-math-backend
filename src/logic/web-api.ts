@@ -343,7 +343,7 @@ function headcount(sessionId: number) {
   const db = loadDB();
   const sess = db.class_sessions.find((s) => s.id === sessionId)!;
   const regular = db.enrollments.filter(
-    (e) => e.class_id === sess.class_id && e.start_date <= sess.date && (e.end_date === null || e.end_date >= sess.date),
+    (e) => e.class_id === sess.class_id && e.start_date <= sess.date && (e.end_date === null || e.end_date > sess.date),
   ).length;
   return regular + db.makeups.filter((m) => m.session_id === sessionId).length;
 }
@@ -546,7 +546,7 @@ export async function getWithdrawInfo(enrollmentId: number, endDate: string) {
   const month = endDate.slice(0, 7);
   const { start, end } = monthRange(month);
   const sessions = db.class_sessions.filter((x) => x.class_id === e.class_id && x.date >= start && x.date <= end && x.date >= e.start_date);
-  const done = sessions.filter((x) => x.date <= endDate).length;
+  const done = sessions.filter((x) => x.date < endDate).length; // 중단일부터는 수업을 듣지 않는다
   const total = sessions.length;
   const ratio = total === 0 || done === 0 ? 1 : done < total / 3 ? 2 / 3 : done < total / 2 ? 1 / 2 : 0;
   const pay = db.payments.find((p) => p.student_id === s.id && p.class_id === e.class_id && p.month === month && p.paid_at);

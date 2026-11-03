@@ -50,13 +50,17 @@ async function insert(client: PoolClient, t: string, r: Row) {
 }
 
 export async function syncChanges(client: PoolClient, before: DB, after: DB) {
-  const deletes: [string, number[]][] = [];
+  // 1) 사라진 줄 먼저 지운다 (자식 표 → 부모 표). 같은 값으로 다시 넣을 때 UNIQUE에 걸리지 않게
+  //    예: 강좌 시간표를 바꾸면 (강좌, 요일) 줄을 지우고 새로 넣는다
+  for (const t of [...TABLES].reverse()) {
+    const ids = new Set((after[t] as unknown as Row[]).map((r) => r.id));
+    const gone = (before[t] as unknown as Row[]).map((r) => r.id).filter((id) => !ids.has(id));
+    if (gone.length) await client.query(`DELETE FROM ${t} WHERE id = ANY($1)`, [gone]);
+  }
+  // 2) 바뀐 줄 UPDATE, 새 줄 INSERT (부모 표 → 자식 표)
   for (const t of TABLES) {
     const old = new Map((before[t] as unknown as Row[]).map((r) => [r.id, r]));
-    const cur = after[t] as unknown as Row[];
-    const seen = new Set<number>();
-    for (const r of cur) {
-      seen.add(r.id);
+    for (const r of after[t] as unknown as Row[]) {
       const o = old.get(r.id);
       if (!o) await insert(client, t, r);
       else if (JSON.stringify(o) !== JSON.stringify(r)) {
@@ -64,10 +68,7 @@ export async function syncChanges(client: PoolClient, before: DB, after: DB) {
         if (cols.length) await client.query(`UPDATE ${t} SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(", ")} WHERE id = $1`, [r.id, ...cols.map((c) => r[c])]);
       }
     }
-    const gone = [...old.keys()].filter((id) => !seen.has(id));
-    if (gone.length) deletes.push([t, gone]);
   }
-  for (const [t, ids] of deletes.reverse()) await client.query(`DELETE FROM ${t} WHERE id = ANY($1)`, [ids]);
 }
 
 // 시연 데이터 넣기: 여러 줄을 한 번에 (원격 DB에 줄마다 보내면 몇 분 걸린다)

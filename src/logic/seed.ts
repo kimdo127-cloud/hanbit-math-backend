@@ -165,7 +165,7 @@ export function createSeed(): DB {
   let attId = 1;
   db.enrollments.forEach((en) => {
     db.class_sessions
-      .filter((s) => s.class_id === en.class_id && s.date >= en.start_date && s.date <= (en.end_date ?? TODAY))
+      .filter((s) => s.class_id === en.class_id && s.date >= en.start_date && (en.end_date ? s.date < en.end_date : s.date <= TODAY))
       .forEach((s, idx) => {
         // 오늘 저녁 수업(18시 이후 시작)은 아직 등원 전 → 키오스크 시연용으로 비워 둔다
         const wd0 = new Date(s.date + "T00:00:00").getDay();
