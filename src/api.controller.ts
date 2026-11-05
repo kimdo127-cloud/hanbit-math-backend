@@ -5,7 +5,7 @@
 // - DB가 막은 것(중복·범위)은 DB 오류를 쉬운 말로 바꿔 돌려준다
 import { Body, Controller, Get, Headers, HttpException, Param, Post } from "@nestjs/common";
 import { sign, verify } from "jsonwebtoken";
-import { pool } from "./db/pool";
+import { pool, SCHEMA } from "./db/pool";
 import { runRequest } from "./db/store";
 import { setupDB } from "./db/setup";
 import * as adminApi from "./logic/admin-api";
@@ -38,15 +38,36 @@ const REG_NAMES: [string, string][] = [
 ];
 const asked = new Map<number, number[]>(); // 보호자별 최근 질문 시각 (분당 10회 제한)
 
+// 챗봇 문의 기록: 휴대폰 번호는 가려서 저장 (개인정보 최소화)
+const maskPhone = (t: string) => t.replace(/01[016789][-\s]?\d{3,4}[-\s]?\d{4}/g, "010-****-****");
+const nowLocal = () => {
+  const d = new Date(); // main.ts에서 TZ=Asia/Seoul
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+async function saveChatLog(parentId: number, question: string, answer: string | null, regulations: string[], status: "answered" | "unknown" | "error") {
+  try {
+    await pool.query(
+      `INSERT INTO ${SCHEMA}.chat_logs (asked_at, parent_id, question, answer, regulations, status) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [nowLocal(), parentId, maskPhone(question), answer === null ? null : maskPhone(answer), [...new Set(regulations)].join(", "), status],
+    );
+  } catch (e) {
+    console.error("chat_logs 저장 실패", e); // 기록 실패가 답을 막지는 않는다
+  }
+}
+
+function verifyWho(auth: string | undefined): Who | null {
+  try {
+    return auth?.startsWith("Bearer ") ? (verify(auth.slice(7), SECRET) as Who) : null;
+  } catch {
+    return null;
+  }
+}
+
 @Controller()
 export class ApiController {
   private async askRegulation(auth: string | undefined, question: unknown) {
-    let who: Who | null = null;
-    try {
-      who = auth?.startsWith("Bearer ") ? (verify(auth.slice(7), SECRET) as Who) : null;
-    } catch {
-      who = null;
-    }
+    const who = verifyWho(auth);
     if (who?.t !== "parent") throw new HttpException({ message: "로그인이 필요해요." }, 401);
     const q = typeof question === "string" ? question.trim() : "";
     if (!q) throw new HttpException({ message: "궁금한 점을 입력해 주세요." }, 400);
@@ -65,15 +86,35 @@ export class ApiController {
     }).catch(() => null);
     if (!res || !res.ok) {
       console.error("dify", res?.status, res && (await res.text()).slice(0, 300));
+      await saveChatLog(who.id, q, null, [], "error");
       throw new HttpException({ message: "지금은 답을 가져오지 못했어요. 잠시 후 다시 시도해 주세요." }, 502);
     }
     const out = (await res.json()) as { answer?: string; metadata?: { retriever_resources?: { document_name: string; content: string; score?: number }[] } };
     // 근거: 검색된 조항 원문 (자세히 보기). 파일 이름 대신 고객용 규정 이름
-    const sources = (out.metadata?.retriever_resources ?? []).map((r) => ({
+    // 조항(제n조)만 근거로 본다. 문서 머리말·구분선 조각은 뺀다
+    const sources = (out.metadata?.retriever_resources ?? []).filter((r) => /^제\d+조/.test(r.content.trim())).map((r) => ({
       regulation: REG_NAMES.find(([p]) => r.document_name.startsWith(p))?.[1] ?? "학원 규정",
       content: r.content,
     }));
-    return { answer: out.answer ?? "", sources };
+    const answer = out.answer ?? "";
+    const unknown = /규정에 없는 내용/.test(answer);
+    await saveChatLog(who.id, q, answer, unknown ? [] : sources.map((x) => x.regulation), unknown ? "unknown" : "answered");
+    return { answer, sources };
+  }
+
+  // 어드민 > 챗봇 문의 내역 (관리자·매니저만)
+  private async listChatLogs(auth: string | undefined) {
+    const who = verifyWho(auth);
+    if (who?.t !== "staff") throw new HttpException({ message: "로그인이 필요해요." }, 401);
+    const me = (await pool.query(`SELECT role, is_active FROM ${SCHEMA}.staff WHERE id = $1`, [who.id])).rows[0];
+    if (!me?.is_active) throw new HttpException({ message: "로그인이 필요해요." }, 401);
+    if (me.role === "member") throw new HttpException({ message: "관리자·매니저만 볼 수 있어요." }, 403);
+    const r = await pool.query(
+      `SELECT l.id, l.asked_at, l.question, l.answer, l.regulations, l.status, p.name AS parent_name, p.email AS parent_email
+       FROM ${SCHEMA}.chat_logs l LEFT JOIN ${SCHEMA}.parents p ON p.id = l.parent_id
+       ORDER BY l.asked_at DESC, l.id DESC LIMIT 500`,
+    );
+    return r.rows;
   }
 
   @Get("health")
@@ -92,6 +133,7 @@ export class ApiController {
     }
     // 규정 묻기: 화면 → 백엔드 → Dify. Dify 키는 백엔드 설정값에만 둔다 (브라우저에 두면 누구나 꺼내 씀)
     if (app === "web" && fn === "askRegulation") return { data: await this.askRegulation(auth, body?.args?.[0]) };
+    if (app === "admin" && fn === "listChatLogs") return { data: await this.listChatLogs(auth) };
 
     const mod = APIS[app];
     const f = mod?.[fn];
