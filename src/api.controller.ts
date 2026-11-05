@@ -30,8 +30,52 @@ const DB_RULES: Record<string, string> = {
   classes_capacity_check: "정원은 1명 이상이어야 해요. (DB가 막음)",
 };
 
+// Dify 지식의 파일 이름 → 고객이 아는 규정 이름
+const REG_NAMES: [string, string][] = [
+  ["01", "수강료 규정"],
+  ["02", "출결·보강 규정"],
+  ["03", "환불·상담 규정"],
+];
+const asked = new Map<number, number[]>(); // 보호자별 최근 질문 시각 (분당 10회 제한)
+
 @Controller()
 export class ApiController {
+  private async askRegulation(auth: string | undefined, question: unknown) {
+    let who: Who | null = null;
+    try {
+      who = auth?.startsWith("Bearer ") ? (verify(auth.slice(7), SECRET) as Who) : null;
+    } catch {
+      who = null;
+    }
+    if (who?.t !== "parent") throw new HttpException({ message: "로그인이 필요해요." }, 401);
+    const q = typeof question === "string" ? question.trim() : "";
+    if (!q) throw new HttpException({ message: "궁금한 점을 입력해 주세요." }, 400);
+    if (q.length > 300) throw new HttpException({ message: "질문은 300자 안으로 줄여 주세요." }, 400);
+    const now = Date.now();
+    const recent = (asked.get(who.id) ?? []).filter((t) => now - t < 60_000);
+    if (recent.length >= 10) throw new HttpException({ message: "잠시 후 다시 물어봐 주세요. (1분에 10번까지)" }, 429);
+    asked.set(who.id, [...recent, now]);
+
+    const key = process.env.DIFY_API_KEY;
+    if (!key) throw new HttpException({ message: "규정 묻기가 아직 연결되지 않았어요." }, 503);
+    const res = await fetch(`${process.env.DIFY_API_URL || "https://api.dify.ai/v1"}/chat-messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ inputs: {}, query: q, response_mode: "blocking", user: `parent-${who.id}` }),
+    }).catch(() => null);
+    if (!res || !res.ok) {
+      console.error("dify", res?.status, res && (await res.text()).slice(0, 300));
+      throw new HttpException({ message: "지금은 답을 가져오지 못했어요. 잠시 후 다시 시도해 주세요." }, 502);
+    }
+    const out = (await res.json()) as { answer?: string; metadata?: { retriever_resources?: { document_name: string; content: string; score?: number }[] } };
+    // 근거: 검색된 조항 원문 (자세히 보기). 파일 이름 대신 고객용 규정 이름
+    const sources = (out.metadata?.retriever_resources ?? []).map((r) => ({
+      regulation: REG_NAMES.find(([p]) => r.document_name.startsWith(p))?.[1] ?? "학원 규정",
+      content: r.content,
+    }));
+    return { answer: out.answer ?? "", sources };
+  }
+
   @Get("health")
   async health() {
     await pool.query("SELECT 1");
@@ -46,6 +90,9 @@ export class ApiController {
       await setupDB();
       return { data: true };
     }
+    // 규정 묻기: 화면 → 백엔드 → Dify. Dify 키는 백엔드 설정값에만 둔다 (브라우저에 두면 누구나 꺼내 씀)
+    if (app === "web" && fn === "askRegulation") return { data: await this.askRegulation(auth, body?.args?.[0]) };
+
     const mod = APIS[app];
     const f = mod?.[fn];
     if (!mod || typeof f !== "function" || HIDDEN.has(fn)) throw new HttpException({ message: "없는 기능이에요." }, 404);

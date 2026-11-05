@@ -406,6 +406,7 @@ export interface StudentRow {
   classes: string[];
   offGrade: boolean; // 대상 학년이 아닌 강좌를 다님 (선행·복습)
   active: boolean; // 다니는 강좌가 있음
+  enrolledBefore: boolean; // 수강 기록이 있음 (없으면 등록만 하고 수강 전)
   attendance: AttendanceSummary;
   unpaid: number;
 }
@@ -422,6 +423,7 @@ export async function listStudents(month = currentMonth()): Promise<StudentRow[]
       classes: act.map((c) => c.name),
       offGrade: act.some((c) => c.target_grade !== s.grade),
       active: act.length > 0,
+      enrolledBefore: db.enrollments.some((e) => e.student_id === s.id),
       attendance: attendanceSummary(db, s.id, month),
       unpaid: paymentRows(db, s, month).filter((p) => p.status === "unpaid").reduce((t, p) => t + p.amount, 0),
       };
@@ -470,6 +472,35 @@ export async function updateStudent(id: number, input: { name: string; grade: Gr
   const after = `${s.name} · ${GRADE_LABEL[s.grade]} · ${s.school} · ${s.birth_date}`;
   if (before !== after) addLog(db, me, id, "student", "update", `학생 정보 수정: ${before} → ${after}`);
   saveDB(db);
+}
+
+// 학생 등록 (상담 후 학원이 한다). 보호자 번호가 학부모 앱 가입의 열쇠가 된다
+// 이미 등록된 보호자 번호면 그 가족에 붙인다 (형제 → 둘째 할인)
+export async function createStudent(input: { name: string; grade: Grade; school: string; birth_date: string; guardians: { relation: string; phone: string }[] }) {
+  await wait();
+  const me = requireManager();
+  if (!input.name.trim() || !input.school.trim() || !input.birth_date) throw new ApiError("이름, 학교, 생년월일을 확인해 주세요.");
+  const guardians = input.guardians.map((g) => ({ relation: g.relation.trim(), phone: g.phone.trim() })).filter((g) => g.relation || g.phone);
+  if (guardians.length === 0) throw new ApiError("보호자 연락처를 한 개 이상 넣어 주세요. 학부모 앱 가입에 쓰여요.");
+  if (guardians.some((g) => !g.relation || !/^[0-9-]{9,13}$/.test(g.phone))) throw new ApiError("보호자 관계와 휴대폰 번호를 확인해 주세요.");
+  const db = loadDB();
+  const digits = (p: string) => p.replace(/[^0-9]/g, "");
+  const linked = db.student_contacts.filter((c) => guardians.some((g) => digits(g.phone) === digits(c.phone)));
+  const known = linked[0];
+  const sameKid = db.students.find((s) => linked.some((c) => c.student_id === s.id) && s.name === input.name.trim());
+  if (sameKid) throw new ApiError(`${sameKid.name} 학생은 이미 등록되어 있어요.`, 409);
+  let familyId = known ? db.students.find((s) => s.id === known.student_id)!.family_id : null;
+  if (familyId === null) {
+    familyId = nextId(db.families);
+    db.families.push({ id: familyId, name: `${input.name.trim()} 가족` });
+  }
+  const sid = nextId(db.students);
+  db.students.push({ id: sid, family_id: familyId, name: input.name.trim(), grade: input.grade, school: input.school.trim(), birth_date: input.birth_date });
+  guardians.forEach((g) => db.student_contacts.push({ id: nextId(db.student_contacts), student_id: sid, relation: g.relation, phone: g.phone }));
+  const sibling = known ? db.students.find((s) => s.id === known.student_id)!.name : null;
+  addLog(db, me, sid, "student", "create", `학생 등록: ${input.name.trim()} · ${GRADE_LABEL[input.grade]} · ${input.school.trim()}${sibling ? ` (${sibling} 학생과 같은 가족)` : ""}`);
+  saveDB(db);
+  return { id: sid, sibling };
 }
 
 export async function endEnrollment(enrollmentId: number, endDate: string) {
@@ -927,7 +958,7 @@ export async function kioskCheckIn(studentId: number, sessionId: number) {
 }
 
 /* ---------- 수강 등록 (운영이 대신) ----------
- * 고객 앱 '수강 신청'과 같은 규칙: 정원, 이미 수강 중이면 거절, 학년이 달라도 가능(선행·복습),
+ * 고객 앱 수강 신청과 같은 규칙(정원, 이미 수강 중이면 거절). 단 학년이 달라도 등록 가능 (선행·복습은 상담·레벨 테스트 후 학원만),
  * 시작일은 그 강좌의 다음 수업일(시스템이 정함). 접수 경로를 함께 남긴다
  */
 export const ENROLL_CHANNELS = ["상담 후 배정", "전화 요청", "방문 요청", "기타"] as const;

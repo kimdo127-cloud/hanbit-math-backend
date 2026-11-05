@@ -1,6 +1,6 @@
 // hw2 스키마에 표를 만들고 시연 데이터를 넣는다:  npm run build && npm run db:setup
 // 주의: hw2 안의 한빛수학 표를 지우고 다시 만든다 (1주차 표는 다른 스키마라 건드리지 않음)
-import "dotenv/config";
+import "../env";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createSeed } from "../logic/seed";

@@ -68,46 +68,48 @@ export async function checkEmail(email: string) {
   if (loadDB().parents.some((p) => p.email === e)) throw new ApiError("이미 가입된 이메일이에요.", 409);
 }
 
-export interface SignupChild {
-  name: string;
-  grade: Grade;
-  school: string;
-  birth_date: string;
+// 가입은 학원이 등록한 보호자 번호로만 한다 (한빛수학 한 곳의 앱 = 등록 학부모 전용)
+// 학원(어드민)이 상담 후 학생과 보호자 번호를 등록 → 보호자가 그 번호 + 자녀 이름으로 가입 → 가족이 자동 연결
+export const ACADEMY_PHONE = "02-000-0000";
+const digits = (p: string) => p.replace(/[^0-9]/g, "");
+
+function findFamilyByPhone(db: DB, phone: string, childName: string) {
+  const ph = digits(phone);
+  if (ph.length < 9) throw new ApiError("휴대폰 번호를 확인해 주세요.");
+  const matched = db.student_contacts.filter((c) => digits(c.phone) === ph).map((c) => db.students.find((s) => s.id === c.student_id)!);
+  if (matched.length === 0) throw new ApiError(`학원에 등록된 보호자 번호가 아니에요. 한빛수학(${ACADEMY_PHONE})으로 문의해 주세요.`, 404);
+  const child = matched.find((s) => s.name === childName.trim());
+  if (!child) throw new ApiError("자녀 이름이 학원에 등록된 정보와 달라요. 다시 확인해 주세요.", 404);
+  if (db.parents.some((p) => p.family_id === child.family_id))
+    throw new ApiError("이미 가입된 가족이에요. 가입한 이메일로 로그인해 주세요.", 409);
+  return child.family_id;
 }
 
-export async function signup(input: {
-  email: string;
-  password: string;
-  name: string;
-  phone: string;
-  relation: string;
-  children: SignupChild[];
-}) {
+// 회원가입 1단계: 학원에 등록된 보호자인지 확인 → 연결될 자녀를 보여 준다
+export async function checkGuardian(phone: string, childName: string) {
   await wait();
   const db = loadDB();
+  const familyId = findFamilyByPhone(db, phone, childName);
+  return {
+    children: db.students
+      .filter((s) => s.family_id === familyId)
+      .sort((a, b) => a.birth_date.localeCompare(b.birth_date))
+      .map((s) => ({ name: s.name, grade: s.grade, school: s.school })),
+  };
+}
+
+export async function signup(input: { email: string; password: string; name: string; phone: string; childName: string }) {
+  await wait();
+  const db = loadDB();
+  const familyId = findFamilyByPhone(db, input.phone, input.childName);
   const email = input.email.trim().toLowerCase();
+  if (!input.name.trim()) throw new ApiError("이름을 입력해 주세요.");
   if (!/^\S+@\S+\.\S+$/.test(email)) throw new ApiError("이메일 형식을 확인해 주세요.");
   if (input.password.length < 8) throw new ApiError("비밀번호는 8자 이상이어야 해요.");
   // 최종에는 DB UNIQUE가 막는다
   if (db.parents.some((p) => p.email === email)) throw new ApiError("이미 가입된 이메일이에요.", 409);
-  if (input.children.length === 0) throw new ApiError("자녀를 한 명 이상 등록해 주세요.");
-
-  const familyId = nextId(db.families);
-  db.families.push({ id: familyId, name: `${input.name} 가족` });
   const parentId = nextId(db.parents);
-  db.parents.push({
-    id: parentId,
-    family_id: familyId,
-    email,
-    password_hash: mockHash(input.password),
-    name: input.name,
-    created_at: TODAY,
-  });
-  input.children.forEach((c) => {
-    const sid = nextId(db.students);
-    db.students.push({ id: sid, family_id: familyId, ...c });
-    db.student_contacts.push({ id: nextId(db.student_contacts), student_id: sid, relation: input.relation, phone: input.phone });
-  });
+  db.parents.push({ id: parentId, family_id: familyId, email, password_hash: mockHash(input.password), name: input.name.trim(), created_at: TODAY });
   saveDB(db);
   setSessionParentId(parentId);
 }
@@ -232,13 +234,15 @@ export async function enroll(studentId: number, classId: number, startDate: stri
   // B2 같은 강좌 동시 수강 불가 (최종: DB 부분 UNIQUE)
   if (db.enrollments.some((e) => e.student_id === s.id && e.class_id === c.id && e.end_date === null))
     throw new ApiError(`${s.name} 학생은 이미 ${c.name}에 다니고 있어요.`, 409);
-  // B4 학년이 달라도 신청 가능 (선행·복습 수강). 화면에서 안내만 한다
+  // B4 학년이 다르면 학부모는 신청할 수 없다. 선행·복습은 상담·레벨 테스트 후 학원(어드민)만 등록한다
+  if (s.grade !== c.target_grade)
+    throw new ApiError(`선행 수강은 학원 상담과 레벨 테스트 후에 등록해 드려요. 한빛수학(${ACADEMY_PHONE})으로 문의해 주세요.`, 403);
   // B3 정원 (최종: 백엔드 + 트랜잭션)
   if (activeCount(db, c.id) >= c.capacity)
     throw new ApiError(`${c.name} 강좌는 정원 ${c.capacity}명이 다 찼어요. 다른 강좌를 골라 주세요.`, 409);
 
   db.enrollments.push({ id: nextId(db.enrollments), student_id: s.id, class_id: c.id, start_date: startDate, end_date: null, refund_amount: null, refunded_at: null });
-  addLog(db, s.id, "enrollment", "create", `수강 신청: ${c.name} (${startDate} 시작)${s.grade !== c.target_grade ? " · 학년 다른 강좌" : ""}`);
+  addLog(db, s.id, "enrollment", "create", `수강 신청: ${c.name} (${startDate} 시작)`);
   saveDB(db);
 }
 
@@ -297,22 +301,19 @@ export async function updateChild(studentId: number, input: { name: string; scho
   if (!input.name.trim() || !input.school.trim() || !input.birth_date) throw new ApiError("이름, 학교, 생년월일을 확인해 주세요.");
   const db = loadDB();
   const s = db.students.find((x) => x.id === studentId)!;
+  // 학년은 수강 강좌와 이어져 있어 학원만 바꾼다
+  if (input.grade !== s.grade) throw new ApiError(`학년 변경은 학원에서 해 드려요. 한빛수학(${ACADEMY_PHONE})으로 문의해 주세요.`, 403);
   const before = `${s.name} · ${GRADE_LABEL[s.grade]} · ${s.school}`;
-  Object.assign(s, { name: input.name.trim(), school: input.school.trim(), grade: input.grade, birth_date: input.birth_date });
+  Object.assign(s, { name: input.name.trim(), school: input.school.trim(), birth_date: input.birth_date });
   addLog(db, s.id, "student", "update", `학생 정보 수정: ${before} → ${s.name} · ${GRADE_LABEL[s.grade]} · ${s.school}`);
   saveDB(db);
 }
 
-export async function addChild(input: { name: string; school: string; grade: Grade; birth_date: string; relation: string; phone: string }) {
+// 자녀는 학원이 등록한다 (같은 보호자 번호로 등록하면 이 가족에 자동으로 붙음)
+export async function addChild() {
   await wait();
-  const parent = requireParent();
-  if (!input.name.trim() || !input.school.trim() || !input.birth_date) throw new ApiError("이름, 학교, 생년월일을 확인해 주세요.");
-  if (!input.relation.trim() || !/^[0-9-]{9,13}$/.test(input.phone.trim())) throw new ApiError("보호자 관계와 연락처를 확인해 주세요.");
-  const db = loadDB();
-  const sid = nextId(db.students);
-  db.students.push({ id: sid, family_id: parent.family_id, name: input.name.trim(), school: input.school.trim(), grade: input.grade, birth_date: input.birth_date });
-  db.student_contacts.push({ id: nextId(db.student_contacts), student_id: sid, relation: input.relation.trim(), phone: input.phone.trim() });
-  saveDB(db);
+  requireParent();
+  throw new ApiError(`자녀는 학원에서 등록해 드려요. 등록하면 앱에 자동으로 연결돼요. 한빛수학(${ACADEMY_PHONE})`, 403);
 }
 
 /* ---------- 보강 신청 · 취소 ---------- */
@@ -636,7 +637,7 @@ export async function getClassDetail(classId: number) {
       name: k.name,
       grade: k.grade,
       enrolled: db.enrollments.some((e) => e.student_id === k.id && e.class_id === c.id && e.end_date === null),
-      gradeDiff: k.grade !== c.target_grade, // 선행·복습: 신청은 되고 안내만
+      gradeDiff: k.grade !== c.target_grade, // 선행·복습: 앱에서는 신청 불가, 상담 안내
     }));
   const done = db.class_sessions.filter((s) => s.class_id === c.id && s.date <= TODAY).length;
   return { cls: classInfo(c), plan, kids, done, firstDate: firstSessionDate(c.id) };

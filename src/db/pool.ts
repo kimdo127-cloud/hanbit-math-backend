@@ -1,5 +1,5 @@
 // PostgreSQL 연결 (Render). 날짜·시각은 화면 코드가 쓰던 문자열 모양 그대로 돌려준다
-import "dotenv/config";
+import "../env";
 import { Pool, types } from "pg";
 
 types.setTypeParser(1082, (v) => v); // date → "2026-10-29"
