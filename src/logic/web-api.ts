@@ -13,6 +13,7 @@ import {
   type PaymentRow,
 } from "./calc";
 import { checkPw, mockHash, TODAY } from "./seed";
+import { isValidInvite } from "./invite";
 import { getSessionParentId, loadDB, nextId, saveDB, setSessionParentId } from "../db/store";
 import type { ActivityLog, ClassRoom, DB, ClassSchedule, Enrollment, Grade, Parent, Student, StudentContact } from "./types";
 
@@ -73,9 +74,12 @@ export async function checkEmail(email: string) {
 export const ACADEMY_PHONE = "02-000-0000";
 const digits = (p: string) => p.replace(/[^0-9]/g, "");
 
-function findFamilyByPhone(db: DB, phone: string, childName: string) {
+function findFamilyByPhone(db: DB, phone: string, childName: string, code?: string) {
   const ph = digits(phone);
   if (ph.length < 9) throw new ApiError("휴대폰 번호를 확인해 주세요.");
+  // 초대 문자의 링크로만 가입: 링크의 코드가 이 보호자 번호에 보낸 코드와 같아야 한다
+  if (!isValidInvite(ph, code))
+    throw new ApiError(`학원에서 받은 초대 문자의 링크로 가입해 주세요. 문자를 받은 번호를 입력해야 해요. 문의: 한빛수학(${ACADEMY_PHONE})`, 403);
   const matched = db.student_contacts.filter((c) => digits(c.phone) === ph).map((c) => db.students.find((s) => s.id === c.student_id)!);
   if (matched.length === 0) throw new ApiError(`학원에 등록된 보호자 번호가 아니에요. 한빛수학(${ACADEMY_PHONE})으로 문의해 주세요.`, 404);
   const child = matched.find((s) => s.name === childName.trim());
@@ -86,10 +90,10 @@ function findFamilyByPhone(db: DB, phone: string, childName: string) {
 }
 
 // 회원가입 1단계: 학원에 등록된 보호자인지 확인 → 연결될 자녀를 보여 준다
-export async function checkGuardian(phone: string, childName: string) {
+export async function checkGuardian(phone: string, childName: string, code?: string) {
   await wait();
   const db = loadDB();
-  const familyId = findFamilyByPhone(db, phone, childName);
+  const familyId = findFamilyByPhone(db, phone, childName, code);
   return {
     children: db.students
       .filter((s) => s.family_id === familyId)
@@ -98,10 +102,10 @@ export async function checkGuardian(phone: string, childName: string) {
   };
 }
 
-export async function signup(input: { email: string; password: string; name: string; phone: string; childName: string }) {
+export async function signup(input: { email: string; password: string; name: string; phone: string; childName: string; code?: string }) {
   await wait();
   const db = loadDB();
-  const familyId = findFamilyByPhone(db, input.phone, input.childName);
+  const familyId = findFamilyByPhone(db, input.phone, input.childName, input.code);
   const email = input.email.trim().toLowerCase();
   if (!input.name.trim()) throw new ApiError("이름을 입력해 주세요.");
   if (!/^\S+@\S+\.\S+$/.test(email)) throw new ApiError("이메일 형식을 확인해 주세요.");

@@ -14,6 +14,7 @@ import {
   type PaymentRow,
 } from "./calc";
 import { checkPw, mockHash, TODAY } from "./seed";
+import { inviteCode } from "./invite";
 import { getSessionStaffId, loadDB, nextId, saveDB, setSessionStaffId } from "../db/store";
 import type { ActivityLog, AttendanceStatus, ClassRoom, ClassSchedule, DB, Grade, Staff, Student } from "./types";
 
@@ -500,7 +501,8 @@ export async function createStudent(input: { name: string; grade: Grade; school:
   const sibling = known ? db.students.find((s) => s.id === known.student_id)!.name : null;
   addLog(db, me, sid, "student", "create", `학생 등록: ${input.name.trim()} · ${GRADE_LABEL[input.grade]} · ${input.school.trim()}${sibling ? ` (${sibling} 학생과 같은 가족)` : ""}`);
   saveDB(db);
-  return { id: sid, sibling };
+  // 초대 문자에 넣을 가입 링크 코드 (보호자 번호마다 하나)
+  return { id: sid, sibling, invites: guardians.map((g) => ({ relation: g.relation, phone: g.phone, code: inviteCode(g.phone) })) };
 }
 
 export async function endEnrollment(enrollmentId: number, endDate: string) {
