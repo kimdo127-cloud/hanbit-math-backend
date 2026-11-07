@@ -106,8 +106,10 @@ export class ApiController {
     }));
     const answer = out.answer ?? "";
     const unknown = /규정에 없는 내용/.test(answer);
-    await saveChatLog(who.id, q, answer, unknown ? [] : sources.map((x) => x.regulation), unknown ? "unknown" : "answered");
-    return { answer, sources };
+    // 규정으로 답하면 마지막 줄에 📄 근거 안내가 붙는다. 없으면 가족 메모(우리 아이 정보)로 답한 것 → 규정 근거를 붙이지 않는다
+    const personal = !unknown && !answer.includes("📄");
+    await saveChatLog(who.id, q, answer, unknown ? [] : personal ? ["가족 정보"] : sources.map((x) => x.regulation), unknown ? "unknown" : "answered");
+    return { answer, sources: personal ? [] : sources };
   }
 
   // 어드민 > 챗봇 문의 내역 (관리자·매니저만)
