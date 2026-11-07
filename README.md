@@ -41,3 +41,16 @@ npm start                   # http://localhost:4000  · 확인: /health
 
 - 고객: `demo@hanbit.kr` / `hanbit1234`
 - 직원: `admin@hanbit.kr` / `admin1234` (관리자), `office@hanbit.kr` / `staff1234` (매니저), `park@hanbit.kr` / `staff1234` (멤버)
+
+## 챗봇 개인 문의 (family_info)
+
+규정 묻기는 `학부모 → 백엔드 → Dify` 순서다. 백엔드는 질문마다 **로그인한 가족의 현황 메모**를 DB에서 새로 만들어 Dify 입력 변수 `family_info`로 함께 보낸다 (`logic/web-api.ts`의 `familyInfoText`).
+
+- 담는 것: 자녀별 듣는 반·다음 수업·이번 달 출결·보강·수강료·최근 레벨테스트·추천 반
+- 담지 않는 것: 다른 가족, 연락처, 이메일, 비밀번호, 강사 메모
+- Dify에는 저장되지 않는다. 계산(보강 가능 횟수, 레벨 판정, 추천 반)은 백엔드 규칙이 하고, Dify는 문장으로만 답한다
+- Dify 앱 설정: 시작 노드에 입력 변수 `family_info`(문단) 추가 → 프롬프트에서 "자녀에 관한 질문은 family_info를 근거로 답한다"
+
+## 레벨테스트
+
+반 편성 근거. 정기(2월·8월 셋째 토요일) · 입학 · 선행. 영역 점수(개념 40 · 유형 40 · 심화 20)만 입력하면 판정(기본·심화·최상위)은 `logic/level.ts` 규칙이 정한다. 강좌 수준도 같은 세 값만 쓴다(DB CHECK).

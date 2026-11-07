@@ -15,8 +15,9 @@ import {
 } from "./calc";
 import { checkPw, mockHash, TODAY } from "./seed";
 import { inviteCode } from "./invite";
+import { ADVANCE_PASS, canAdvance, judgeLevel, latestPlacement, LEVEL_MAX, LEVEL_TEST_KIND_LABEL, nextRegularTest } from "./level";
 import { getSessionStaffId, loadDB, nextId, saveDB, setSessionStaffId } from "../db/store";
-import type { ActivityLog, AttendanceStatus, ClassRoom, ClassSchedule, DB, Grade, Staff, Student } from "./types";
+import type { ActivityLog, AttendanceStatus, ClassLevel, ClassRoom, ClassSchedule, DB, Grade, LevelTest, LevelTestKind, Staff, Student } from "./types";
 
 // 변경 이력 남기기 (직원이 한 일). 백엔드에서는 같은 트랜잭션 안에서 activity_logs에 INSERT
 function addLog(db: DB, me: Staff, studentId: number | null, entity: ActivityLog["entity"], action: ActivityLog["action"], summary: string) {
@@ -301,7 +302,7 @@ export interface ClassInput {
   teacher_id: number;
   capacity: number;
   monthly_fee: number;
-  level: string;
+  level: ClassLevel; // 기본 · 심화 · 최상위 (레벨테스트 판정과 같은 값)
   description: string;
   textbook: string;
   schedules: { weekday: number; start_time: string; end_time: string }[];
@@ -320,6 +321,7 @@ export async function saveClass(id: number | null, input: ClassInput) {
   // 최종: DB CHECK (end_time > start_time)
   if (input.schedules.some((s) => s.end_time <= s.start_time)) throw new ApiError("끝 시각은 시작 시각보다 늦어야 해요.");
   if (input.capacity < 1) throw new ApiError("정원은 1명 이상이어야 해요.");
+  if (!["기본", "심화", "최상위"].includes(input.level)) throw new ApiError("수준은 기본·심화·최상위 중에서 골라 주세요.");
   if (id !== null && input.capacity < activeCount(db, id)) throw new ApiError(`지금 ${activeCount(db, id)}명이 다니고 있어서 정원을 더 줄일 수 없어요.`);
   // B5 같은 강사 시간 겹침 (최종: 백엔드 — 강좌·시간표 두 테이블을 함께 봐야 함)
   const teacherClasses = db.classes.filter((c) => c.teacher_id === input.teacher_id && c.id !== id);
@@ -339,7 +341,7 @@ export async function saveClass(id: number | null, input: ClassInput) {
     teacher_id: input.teacher_id,
     capacity: input.capacity,
     monthly_fee: input.monthly_fee,
-    level: input.level.trim(),
+    level: input.level,
     description: input.description.trim(),
     textbook: input.textbook.trim(),
   };
@@ -410,6 +412,7 @@ export interface StudentRow {
   enrolledBefore: boolean; // 수강 기록이 있음 (없으면 등록만 하고 수강 전)
   attendance: AttendanceSummary;
   unpaid: number;
+  level: string | null; // 최근 레벨테스트 판정 (정기·입학)
 }
 
 export async function listStudents(month = currentMonth()): Promise<StudentRow[]> {
@@ -427,6 +430,7 @@ export async function listStudents(month = currentMonth()): Promise<StudentRow[]
       enrolledBefore: db.enrollments.some((e) => e.student_id === s.id),
       attendance: attendanceSummary(db, s.id, month),
       unpaid: paymentRows(db, s, month).filter((p) => p.status === "unpaid").reduce((t, p) => t + p.amount, 0),
+      level: latestPlacement(db, s.id)?.result_level ?? null,
       };
     })
     .sort((a, b) => Number(b.active) - Number(a.active) || a.student.grade - b.student.grade || a.student.name.localeCompare(b.student.name));
@@ -458,6 +462,8 @@ export async function getStudentDetail(id: number, month = currentMonth()) {
       .sort((a, b) => b.localeCompare(a))
       .flatMap((m) => paymentRows(db, s, m).map((r) => ({ ...r, month: m }))),
     logs: db.activity_logs.filter((l) => l.student_id === id).sort((a, b) => b.at.localeCompare(a.at)),
+    levelTests: db.level_tests.filter((t) => t.student_id === id).sort((a, b) => b.tested_on.localeCompare(a.tested_on) || b.id - a.id).map(viewTest),
+    canAdvance: canAdvance(db, id),
   };
 }
 
@@ -988,3 +994,139 @@ export async function enrollByStaff(studentId: number, classId: number, channel:
   saveDB(db);
   return { start };
 }
+
+
+/* ---------- 레벨테스트 ---------- */
+// 정기(2월·8월) · 입학 · 선행. 판정은 점수로 백엔드가 계산한다 (직원이 레벨을 고르지 않음)
+// 입력 권한: 관리자·매니저는 모든 학생, 멤버(강사)는 담당 강좌 학생만
+
+export interface LevelTestView extends LevelTest {
+  kindLabel: string;
+  staffName: string;
+}
+function viewTest(t: LevelTest): LevelTestView {
+  return { ...t, kindLabel: LEVEL_TEST_KIND_LABEL[t.kind], staffName: loadDB().staff.find((x) => x.id === t.staff_id)?.name ?? "" };
+}
+export const levelTestRules = () => ({ max: LEVEL_MAX, advancePass: ADVANCE_PASS, nextRegular: nextRegularTest(TODAY) });
+
+function canEditStudentTests(db: DB, me: Staff, studentId: number) {
+  if (me.role !== "member") return true;
+  return db.enrollments.some((e) => e.student_id === studentId && e.end_date === null && db.classes.find((c) => c.id === e.class_id)?.teacher_id === me.id);
+}
+
+export interface LevelScoreInput {
+  concept: number;
+  type: number;
+  advanced: number;
+  memo?: string;
+}
+function checkScores(x: LevelScoreInput) {
+  const ok = (v: number, max: number) => Number.isInteger(v) && v >= 0 && v <= max;
+  if (!ok(x.concept, LEVEL_MAX.concept) || !ok(x.type, LEVEL_MAX.type) || !ok(x.advanced, LEVEL_MAX.advanced))
+    throw new ApiError(`점수를 확인해 주세요. 개념 0~${LEVEL_MAX.concept}, 유형 0~${LEVEL_MAX.type}, 심화 0~${LEVEL_MAX.advanced}점이에요.`);
+}
+
+// 점수 → 판정까지 채운 한 줄 (같은 학생·종류·날짜가 있으면 고쳐 쓴다)
+function putTest(db: DB, me: Staff, student: Student, kind: LevelTestKind, testedOn: string, x: LevelScoreInput) {
+  checkScores(x);
+  const testGrade = (kind === "advance" ? student.grade + 1 : student.grade) as Grade;
+  if (testGrade > 12) throw new ApiError("고3은 선행 테스트를 볼 수 없어요.");
+  const total = x.concept + x.type + x.advanced;
+  const row = {
+    student_id: student.id,
+    kind,
+    tested_on: testedOn,
+    test_grade: testGrade,
+    concept_score: x.concept,
+    type_score: x.type,
+    advanced_score: x.advanced,
+    total_score: total,
+    result_level: judgeLevel(x.concept, x.type, x.advanced),
+    advance_ok: kind === "advance" && total >= ADVANCE_PASS,
+    staff_id: me.id,
+    memo: (x.memo ?? "").trim(),
+  };
+  const old = db.level_tests.find((t) => t.student_id === student.id && t.kind === kind && t.tested_on === testedOn);
+  const label = `${LEVEL_TEST_KIND_LABEL[kind]} 레벨테스트 ${md(testedOn)}`;
+  if (old) {
+    if (old.total_score === total && old.concept_score === x.concept && old.type_score === x.type && old.memo === row.memo) return;
+    addLog(db, me, student.id, "level_test", "update", `${label} 수정: ${old.total_score}점(${old.result_level}) → ${total}점(${row.result_level})`);
+    Object.assign(old, row);
+  } else {
+    db.level_tests.push({ id: nextId(db.level_tests), ...row });
+    addLog(db, me, student.id, "level_test", "create", `${label}: ${total}점 · ${row.result_level}${kind === "advance" ? (row.advance_ok ? " · 선행 통과" : " · 선행 미통과") : ""}`);
+  }
+}
+
+// 학생 상세에서 한 건 입력 (입학·선행 같은 수시 테스트, 정기 테스트 개별 입력)
+export async function addLevelTest(studentId: number, input: LevelScoreInput & { kind: LevelTestKind; testedOn: string }) {
+  await wait();
+  const me = requireStaff();
+  const db = loadDB();
+  const s = db.students.find((x) => x.id === studentId);
+  if (!s) throw new ApiError("없는 학생이에요.", 404);
+  if (!canEditStudentTests(db, me, studentId)) throw new ApiError("담당 강좌 학생만 입력할 수 있어요.", 403);
+  if (!["regular", "entry", "advance"].includes(input.kind)) throw new ApiError("테스트 종류를 골라 주세요.");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.testedOn) || input.testedOn > TODAY) throw new ApiError("시험 날짜는 오늘이나 지난 날짜여야 해요.");
+  putTest(db, me, s, input.kind, input.testedOn, input);
+  saveDB(db);
+}
+
+export async function deleteLevelTest(testId: number) {
+  await wait();
+  const me = requireManager();
+  const db = loadDB();
+  const t = db.level_tests.find((x) => x.id === testId);
+  if (!t) return;
+  db.level_tests = db.level_tests.filter((x) => x.id !== testId);
+  addLog(db, me, t.student_id, "level_test", "cancel", `${LEVEL_TEST_KIND_LABEL[t.kind]} 레벨테스트 ${md(t.tested_on)} 기록 삭제 (${t.total_score}점 · ${t.result_level})`);
+  saveDB(db);
+}
+
+// 정기 테스트 일괄 입력 표: 강좌 수강생 전체를 한 화면에서 (학생 50명이면 한 번에 50건)
+export interface LevelSheetRow {
+  student: Student;
+  test: LevelTestView | null; // 이 날짜에 이미 입력한 결과
+  previous: { tested_on: string; total_score: number; result_level: string } | null; // 그 전 결과 (비교용)
+}
+export async function getLevelTestSheet(classId: number, testedOn: string) {
+  await wait();
+  const me = requireStaff();
+  const db = loadDB();
+  const cls = db.classes.find((c) => c.id === classId);
+  if (!cls || !visible(me, cls)) throw new ApiError("담당 강좌만 볼 수 있어요.", 403);
+  const rows: LevelSheetRow[] = db.enrollments
+    .filter((e) => e.class_id === classId && e.end_date === null)
+    .map((e) => db.students.find((x) => x.id === e.student_id)!)
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((s) => {
+      const t = db.level_tests.find((x) => x.student_id === s.id && x.kind === "regular" && x.tested_on === testedOn);
+      const prev = db.level_tests
+        .filter((x) => x.student_id === s.id && x.kind !== "advance" && x.tested_on < testedOn)
+        .sort((a, b) => b.tested_on.localeCompare(a.tested_on))[0];
+      return { student: s, test: t ? viewTest(t) : null, previous: prev ? { tested_on: prev.tested_on, total_score: prev.total_score, result_level: prev.result_level } : null };
+    });
+  return { cls: { id: cls.id, name: cls.name, level: cls.level }, testedOn, rows };
+}
+
+export async function saveLevelTestSheet(classId: number, testedOn: string, entries: (LevelScoreInput & { studentId: number })[]) {
+  await wait();
+  const me = requireStaff();
+  const db = loadDB();
+  const cls = db.classes.find((c) => c.id === classId);
+  if (!cls || !visible(me, cls)) throw new ApiError("담당 강좌만 입력할 수 있어요.", 403);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(testedOn) || testedOn > TODAY) throw new ApiError("시험 날짜는 오늘이나 지난 날짜여야 해요.");
+  const roster = new Set(db.enrollments.filter((e) => e.class_id === classId && e.end_date === null).map((e) => e.student_id));
+  for (const x of entries) {
+    if (!roster.has(x.studentId)) throw new ApiError("이 강좌 수강생만 입력할 수 있어요.", 403);
+    const s = db.students.find((k) => k.id === x.studentId)!;
+    try {
+      putTest(db, me, s, "regular", testedOn, x);
+    } catch (e) {
+      throw new ApiError(`${s.name}: ${(e as Error).message}`);
+    }
+  }
+  saveDB(db);
+  return { saved: entries.length };
+}
+

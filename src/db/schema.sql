@@ -5,7 +5,7 @@
 CREATE SCHEMA IF NOT EXISTS __SCHEMA__;
 SET search_path TO __SCHEMA__;
 
-DROP TABLE IF EXISTS chat_logs, activity_logs, staff_tokens, payments, makeups, attendances, class_sessions, enrollments, class_schedules, classes, staff, student_contacts, students, parents, families CASCADE;
+DROP TABLE IF EXISTS chat_logs, level_tests, activity_logs, staff_tokens, payments, makeups, attendances, class_sessions, enrollments, class_schedules, classes, staff, student_contacts, students, parents, families CASCADE;
 
 -- 가족: 형제를 묶는 단위 (둘째 할인)
 CREATE TABLE families (
@@ -70,7 +70,7 @@ CREATE TABLE classes (
   teacher_id integer NOT NULL REFERENCES staff(id),
   capacity smallint NOT NULL CHECK (capacity > 0),
   monthly_fee integer NOT NULL CHECK (monthly_fee >= 0),
-  level text NOT NULL DEFAULT '',
+  level text NOT NULL CHECK (level IN ('기본', '심화', '최상위')),   -- 레벨테스트 판정과 같은 값
   description text NOT NULL DEFAULT '',
   textbook text NOT NULL DEFAULT ''
 );
@@ -139,6 +139,28 @@ CREATE TABLE payments (
   UNIQUE (student_id, class_id, month),
   CHECK ((paid_amount IS NULL) = (paid_at IS NULL))
 );
+
+-- 레벨테스트: 반 편성 근거. 정기(2월·8월) · 입학 · 선행. 쪽지시험은 기록하지 않는다
+-- 판정(result_level)은 백엔드가 점수로 계산해 넣는다. 영역 점수 범위와 합계는 DB가 지킨다
+CREATE TABLE level_tests (
+  id integer PRIMARY KEY,
+  student_id integer NOT NULL REFERENCES students(id),
+  kind text NOT NULL CHECK (kind IN ('regular', 'entry', 'advance')),
+  tested_on date NOT NULL,
+  test_grade smallint NOT NULL CHECK (test_grade BETWEEN 7 AND 12),
+  concept_score smallint NOT NULL CHECK (concept_score BETWEEN 0 AND 40),
+  type_score smallint NOT NULL CHECK (type_score BETWEEN 0 AND 40),
+  advanced_score smallint NOT NULL CHECK (advanced_score BETWEEN 0 AND 20),
+  total_score smallint NOT NULL,
+  result_level text NOT NULL CHECK (result_level IN ('기본', '심화', '최상위')),
+  advance_ok boolean NOT NULL DEFAULT false,
+  staff_id integer NOT NULL REFERENCES staff(id),
+  memo text NOT NULL DEFAULT '',
+  CHECK (total_score = concept_score + type_score + advanced_score),
+  CHECK (NOT advance_ok OR kind = 'advance'),
+  UNIQUE (student_id, kind, tested_on)
+);
+CREATE INDEX level_tests_student ON level_tests (student_id, tested_on DESC);
 
 -- 변경 이력: 쌓기만 한다
 CREATE TABLE activity_logs (

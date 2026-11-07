@@ -14,8 +14,9 @@ import {
 } from "./calc";
 import { checkPw, mockHash, TODAY } from "./seed";
 import { isValidInvite } from "./invite";
+import { canAdvance, latestAdvance, latestPlacement, LEVEL_TEST_KIND_LABEL, nextRegularTest, recommendClasses, regularTestDates, upcomingRegularTest } from "./level";
 import { getSessionParentId, loadDB, nextId, saveDB, setSessionParentId } from "../db/store";
-import type { ActivityLog, ClassRoom, DB, ClassSchedule, Enrollment, Grade, Parent, Student, StudentContact } from "./types";
+import type { ActivityLog, ClassRoom, DB, ClassSchedule, Enrollment, Grade, LevelTest, Parent, Student, StudentContact } from "./types";
 
 const md = (d: string) => `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`;
 // 변경 이력 남기기 (고객이 한 일). 백엔드에서는 같은 트랜잭션 안에서 activity_logs에 INSERT
@@ -618,6 +619,8 @@ export async function listAllClasses() {
   return db.classes.map((c) => ({
     ...classInfo(c),
     myKids: kids.filter((k) => db.enrollments.some((e) => e.student_id === k.id && e.class_id === c.id && e.end_date === null)).map((k) => k.name),
+    // 최근 레벨테스트 판정이 이 강좌 레벨과 같은 같은 학년 아이 ("우리 아이 레벨")
+    levelKids: kids.filter((k) => k.grade === c.target_grade && latestPlacement(db, k.id)?.result_level === c.level).map((k) => k.name),
   }));
 }
 
@@ -674,4 +677,106 @@ export async function getPlanned(studentId: number, month: string) {
   return db.class_sessions
     .filter((x) => classIds.includes(x.class_id) && x.date > TODAY && x.date.startsWith(month))
     .map((x) => ({ date: x.date, className: db.classes.find((c) => c.id === x.class_id)!.name, time: timeOf(x.class_id, x.date), topic: x.topic }));
+}
+
+
+/* ---------- 레벨테스트 (MY › 자녀 · 홈 안내 · 캘린더) ---------- */
+
+export interface LevelTestView extends LevelTest {
+  kindLabel: string;
+}
+const viewTest = (t: LevelTest): LevelTestView => ({ ...t, kindLabel: LEVEL_TEST_KIND_LABEL[t.kind] });
+
+// 자녀의 레벨테스트 기록 + 반 편성에 쓰는 최근 결과 + 선행 상담 가능 여부
+export async function getLevelTests(studentId: number) {
+  await wait();
+  const s = requireOwnStudent(studentId);
+  const db = loadDB();
+  const latest = latestPlacement(db, s.id);
+  return {
+    tests: db.level_tests.filter((t) => t.student_id === s.id).sort((a, b) => b.tested_on.localeCompare(a.tested_on) || b.id - a.id).map(viewTest),
+    latest: latest ? viewTest(latest) : null,
+    canAdvance: canAdvance(db, s.id),
+    nextRegular: nextRegularTest(TODAY),
+  };
+}
+
+// 홈 안내 카드: 정기 레벨테스트 14일 전부터 (2월·8월)
+export async function getLevelTestNotice() {
+  await wait();
+  requireParent();
+  return upcomingRegularTest(TODAY);
+}
+
+// 캘린더: 그 달의 정기 레벨테스트 날짜
+export async function getLevelTestDates(month: string) {
+  await wait();
+  requireParent();
+  return regularTestDates(Number(month.slice(0, 4))).filter((d) => d.startsWith(month));
+}
+
+/* ---------- 챗봇에 넘기는 가족 메모 (family_info) ---------- */
+// 백엔드가 질문마다 새로 만든다. Dify는 이 메모와 규정 문서만 보고 답한다 (DB에 직접 접근하지 않음)
+// 담는 것: 로그인한 가족의 자녀별 반·다음 수업·이번 달 출결·보강·수강료·최근 레벨테스트·추천 반
+// 담지 않는 것: 다른 가족, 연락처, 이메일, 비밀번호, 강사 메모
+const WD = ["일", "월", "화", "수", "목", "금", "토"];
+const won = (n: number) => `${n.toLocaleString("ko-KR")}원`;
+
+export function familyInfoText(): string {
+  const parent = requireParent();
+  const db = loadDB();
+  const month = currentMonth();
+  const kids = db.students.filter((s) => s.family_id === parent.family_id).sort((a, b) => a.birth_date.localeCompare(b.birth_date) || a.id - b.id);
+  const lines = [`기준일 ${TODAY} · 보호자 ${parent.name}`];
+  for (const k of kids) {
+    lines.push("", `[${k.name} · ${GRADE_LABEL[k.grade]}]`);
+    const active = db.enrollments.filter((e) => e.student_id === k.id && e.end_date === null).map((e) => db.classes.find((c) => c.id === e.class_id)!);
+    lines.push(
+      `- 듣는 반: ${
+        active.length
+          ? active
+              .map((c) => {
+                const sch = db.class_schedules.filter((x) => x.class_id === c.id).sort((a, b) => a.weekday - b.weekday);
+                return `${c.name}(${c.level}) ${sch.map((x) => WD[x.weekday]).join("·")} ${sch[0]?.start_time ?? ""}~${sch[0]?.end_time ?? ""}`;
+              })
+              .join(", ")
+          : "없음"
+      }`,
+    );
+    const ids = active.map((c) => c.id);
+    const next = db.class_sessions.filter((x) => ids.includes(x.class_id) && x.date >= TODAY).sort((a, b) => a.date.localeCompare(b.date))[0];
+    if (next) lines.push(`- 다음 수업: ${next.date === TODAY ? "오늘 " : ""}${md(next.date)}(${WD[new Date(next.date + "T00:00").getDay()]}) ${timeOf(next.class_id, next.date).split("~")[0]} ${db.classes.find((c) => c.id === next.class_id)!.name}`);
+    const a = attendanceSummary(db, k.id, month);
+    lines.push(`- 이번 달(${Number(month.slice(5))}월) 출결: 출석 ${a.present} · 지각 ${a.late} · 결석 ${a.absent}`);
+    const mk = absenceMakeups(k.id).filter((x) => x.state !== "expired");
+    const open = mk.filter((x) => x.state === "available" || x.state === "full");
+    const booked = mk.filter((x) => x.state === "booked");
+    lines.push(
+      `- 보강: ${open.length ? `신청 가능 ${open.length}회 (${open.map((x) => `${md(x.date)} 결석분, ${md(x.deadline)}까지${x.state === "full" ? ", 지금 빈자리 없음" : ""}`).join(" / ")})` : "신청할 보강 없음"}${
+        booked.length ? ` · 예약됨 ${booked.map((x) => `${md(x.booked!.date)} ${x.booked!.className}`).join(", ")}` : ""
+      }`,
+    );
+    const pays = paymentRows(db, k, month);
+    lines.push(`- 이번 달 수강료: ${pays.length ? pays.map((p) => `${p.className} ${won(p.amount)} ${p.status === "paid" ? "납부 완료" : "미납"}`).join(", ") : "청구 없음"}`);
+    const t = latestPlacement(db, k.id);
+    lines.push(
+      t
+        ? `- 최근 레벨테스트: ${md(t.tested_on)} ${LEVEL_TEST_KIND_LABEL[t.kind]} · ${t.total_score}점(개념 ${t.concept_score}/40 · 유형 ${t.type_score}/40 · 심화 ${t.advanced_score}/20) · 판정 ${t.result_level}`
+        : "- 최근 레벨테스트: 기록 없음 (반 추천은 레벨테스트 후 가능)",
+    );
+    const adv = latestAdvance(db, k.id);
+    if (adv) lines.push(`- 선행 테스트: ${md(adv.tested_on)} ${adv.total_score}점 · ${adv.advance_ok ? "통과" : "미통과"}`);
+    if (t) {
+      const rec = recommendClasses(db, k, TODAY);
+      const ok = rec.items.filter((r) => r.seatsLeft > 0 && !r.overlap);
+      const other = rec.items.filter((r) => !(r.seatsLeft > 0 && !r.overlap));
+      lines.push(
+        `- 추천 반(같은 학년 · ${rec.level}): ${ok.length ? ok.map((r) => `${r.cls.name} 자리 ${r.seatsLeft}`).join(", ") : "지금 신청 가능한 반 없음"}${
+          other.length ? ` / 참고: ${other.map((r) => `${r.cls.name}(${r.seatsLeft === 0 ? "마감" : "지금 시간표와 겹침"})`).join(", ")}` : ""
+        }`,
+      );
+      if (canAdvance(db, k.id)) lines.push("- 선행반: 상담 대상 (선행은 앱 신청 불가, 상담 후 학원이 신청)");
+    }
+  }
+  return lines.join("\n");
 }

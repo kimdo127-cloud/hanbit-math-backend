@@ -15,7 +15,7 @@ const SECRET = process.env.JWT_SECRET || "dev-only-secret";
 type Who = { t: "parent" | "staff"; id: number };
 
 // 화면에서 부르면 안 되는 내부 함수는 막는다
-const HIDDEN = new Set(["ApiError", "default"]);
+const HIDDEN = new Set(["ApiError", "default", "familyInfoText"]);
 const APIS: Record<string, Record<string, unknown>> = { web: webApi, admin: adminApi };
 
 // DB 제약 이름 → 쉬운 말 (DBeaver로 직접 넣어도 같은 규칙으로 막힘)
@@ -27,6 +27,8 @@ const DB_RULES: Record<string, string> = {
   parents_email_key: "이미 가입한 이메일이에요. (DB가 막음)",
   staff_email_key: "이미 쓰고 있는 이메일이에요. (DB가 막음)",
   class_schedules_check: "끝 시각은 시작 시각보다 늦어야 해요. (DB가 막음)",
+  level_tests_check: "레벨테스트 합계 점수가 영역 점수의 합과 달라요. (DB가 막음)",
+  level_tests_student_id_kind_tested_on_key: "같은 날 같은 종류의 레벨테스트 기록이 이미 있어요. (DB가 막음)",
   classes_capacity_check: "정원은 1명 이상이어야 해요. (DB가 막음)",
 };
 
@@ -79,10 +81,13 @@ export class ApiController {
 
     const key = process.env.DIFY_API_KEY;
     if (!key) throw new HttpException({ message: "규정 묻기가 아직 연결되지 않았어요." }, 503);
+    // 가족 메모(family_info): 질문마다 DB에서 새로 만든다. 로그인한 가족 것만 담기고 Dify에는 저장되지 않는다
+    // Dify 앱의 입력 변수 family_info(문단)로 받는다. 규정 검색은 질문(query)으로만 하므로 메모가 검색을 흐리지 않는다
+    const familyInfo = (await runRequest({ parentId: who.id, staffId: null }, async () => webApi.familyInfoText())).result;
     const res = await fetch(`${process.env.DIFY_API_URL || "https://api.dify.ai/v1"}/chat-messages`, {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ inputs: {}, query: q, response_mode: "blocking", user: `parent-${who.id}` }),
+      body: JSON.stringify({ inputs: { family_info: familyInfo }, query: q, response_mode: "blocking", user: `parent-${who.id}` }),
     }).catch(() => null);
     if (!res || !res.ok) {
       console.error("dify", res?.status, res && (await res.text()).slice(0, 300));

@@ -1,17 +1,18 @@
 import { compareSync, hashSync } from "bcryptjs";
 // 빈 화면을 보지 않게 넣는 가상 데이터. 나중에 백엔드 시드 SQL로 옮긴다.
-import type { ActivityLog, AttendanceStatus, DB, Grade } from "./types";
+import type { ActivityLog, AttendanceStatus, ClassLevel, DB, Grade } from "./types";
+import { judgeLevel } from "./level";
 
 // 목업 기준일. 백엔드를 붙이면 서버의 오늘 날짜로 바뀐다.
 // 강좌 소개 (상세 화면용)
-const CLASS_INFO: Record<string, { level: string; description: string; textbook: string }> = {
+const CLASS_INFO: Record<string, { level: ClassLevel; description: string; textbook: string }> = {
   "중1 개념 기본": { level: "기본", description: "중학 수학을 처음 시작하는 강좌예요. 개념을 천천히 짚고, 매 수업 끝에 확인 문제로 이해했는지 점검해요.", textbook: "개념원리 중학 수학 1-2" },
   "중2 내신 대비": { level: "기본", description: "교과서 개념과 유형 문제를 함께 다뤄요. 학교 진도에 맞춰 내신 시험 3주 전부터는 기출 위주로 준비해요.", textbook: "개념원리 중학 수학 2-2 · 쎈 중2-2" },
   "중2 심화": { level: "심화", description: "개념을 알고 있는 학생이 응용·심화 문제를 푸는 강좌예요. 서술형 풀이를 매주 첨삭해요.", textbook: "블랙라벨 중2-2" },
   "중2 금요 보충": { level: "기본", description: "주 1회 금요일에 듣는 보충 강좌예요. 한 주 동안 배운 내용을 복습하고 부족한 유형을 채워요.", textbook: "쎈 중2-2" },
-  "중3 내신 + 고등 선행": { level: "내신 대비", description: "중3 내신과 고등 수학 준비를 함께 해요. 2학기에는 고1 공통수학 선행을 시작해요.", textbook: "개념원리 중학 수학 3-2 · 고등 공통수학1" },
-  "고1 공통수학 내신": { level: "내신 대비", description: "고1 공통수학 내신 강좌예요. 학교별 기출을 분석해 시험 범위에 맞춘 문제를 풀어요.", textbook: "개념원리 공통수학1 · 학교 부교재" },
-  "고2 수학Ⅰ·Ⅱ 수능 기초": { level: "수능 기초", description: "수학Ⅰ·Ⅱ 개념을 정리하고 수능형 문제에 익숙해지는 강좌예요.", textbook: "수학의 정석 수학Ⅰ · 수능특강" },
+  "중3 내신 + 고등 선행": { level: "심화", description: "중3 내신과 고등 수학 준비를 함께 해요. 2학기에는 고1 공통수학 선행을 시작해요.", textbook: "개념원리 중학 수학 3-2 · 고등 공통수학1" },
+  "고1 공통수학 내신": { level: "기본", description: "고1 공통수학 내신 강좌예요. 학교별 기출을 분석해 시험 범위에 맞춘 문제를 풀어요.", textbook: "개념원리 공통수학1 · 학교 부교재" },
+  "고2 수학Ⅰ·Ⅱ 수능 기초": { level: "기본", description: "수학Ⅰ·Ⅱ 개념을 정리하고 수능형 문제에 익숙해지는 강좌예요.", textbook: "수학의 정석 수학Ⅰ · 수능특강" },
 };
 
 // 학년별 진도 (수업 내용 시연용)
@@ -65,6 +66,7 @@ export function createSeed(): DB {
     payments: [],
     activity_logs: [],
     staff_tokens: [],
+    level_tests: [],
   };
 
   // 직원
@@ -210,6 +212,27 @@ export function createSeed(): DB {
         paid_at: unpaid ? null : `${month}-05`,
       });
     });
+  });
+
+  // 레벨테스트 시연: 입학 테스트(8/20, 한실장 입력) — 반 레벨에 맞춘 점수. 정기 테스트는 2월·8월 셋째 토요일
+  // 서준: 심화 판정인데 기본반을 다님 → 심화반 추천(마감) / 하린: 최상위 + 선행 테스트 통과 → 선행 상담 대상
+  const addTest = (studentId: number, kind: "regular" | "entry" | "advance", tested_on: string, grade: number, c: number, t: number, a: number, staff_id: number, memo = "") => {
+    const total = c + t + a;
+    db.level_tests.push({
+      id: db.level_tests.length + 1, student_id: studentId, kind, tested_on, test_grade: grade as Grade,
+      concept_score: c, type_score: t, advanced_score: a, total_score: total, result_level: judgeLevel(c, t, a),
+      advance_ok: kind === "advance" && total >= 70, staff_id, memo,
+    });
+  };
+  addTest(1, "entry", "2026-08-20", 8, 30, 32, 14, 5, "개념은 탄탄함. 서술형 풀이 연습 필요");
+  addTest(2, "entry", "2026-08-20", 7, 36, 38, 17, 5, "계산 실수 거의 없음");
+  addTest(2, "advance", "2026-10-17", 8, 31, 30, 13, 2, "중2 1단원 선행 테스트");
+  db.students.filter((st) => st.id > 2).forEach((st) => {
+    const en = db.enrollments.find((e) => e.student_id === st.id)!;
+    const lv = db.classes.find((c) => c.id === en.class_id)!.level;
+    const r = (n: number) => (st.id * n) % 7; // 학생마다 다른 점수 (재현 가능)
+    const [c, t, a] = lv === "심화" ? [26 + r(3), 26 + r(5), 10 + r(2)] : [17 + r(3) * 2, 18 + r(5) * 2, 4 + r(2)];
+    addTest(st.id, "entry", en.start_date === "2026-09-01" ? "2026-08-20" : "2026-09-26", st.grade, c, t, a, 5);
   });
 
   // 변경 이력 시연: 수강 등록·보강 신청·수강 중단·환불 기록

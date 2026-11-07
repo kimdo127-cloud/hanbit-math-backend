@@ -2,6 +2,7 @@
 
 export type Grade = 7 | 8 | 9 | 10 | 11 | 12; // 중1=7 … 고3=12
 export type AttendanceStatus = "present" | "late" | "absent";
+export type ClassLevel = "기본" | "심화" | "최상위";
 
 export interface Family {
   id: number;
@@ -62,7 +63,7 @@ export interface ClassRoom {
   teacher_id: number;
   capacity: number; // 기본 8
   monthly_fee: number;
-  level: string; // 수준: 기본 · 심화 · 내신 대비 등
+  level: ClassLevel; // 수준: 레벨테스트 판정과 같은 값 (목적은 이름·소개에)
   description: string; // 강좌 소개
   textbook: string; // 교재 (교재비 별도)
 }
@@ -117,8 +118,27 @@ export interface Payment {
   paid_at: string | null;
 }
 
+// 레벨테스트: 반 편성 근거. 정기(2월·8월) · 입학 · 선행. 점수는 영역별(개념 40 · 유형 40 · 심화 20)
+// 쪽지시험처럼 자주 보는 시험은 기록하지 않는다 (결정에 쓰는 시험만)
+export type LevelTestKind = "regular" | "entry" | "advance";
+export interface LevelTest {
+  id: number;
+  student_id: number;
+  kind: LevelTestKind;
+  tested_on: string; // "2026-08-22"
+  test_grade: Grade; // 시험지 학년 (선행 테스트는 다음 학년)
+  concept_score: number; // 0~40
+  type_score: number; // 0~40
+  advanced_score: number; // 0~20
+  total_score: number; // 합계 (화면·통계용으로 저장, 세 점수의 합과 같아야 함 → DB CHECK)
+  result_level: ClassLevel; // 판정 레벨 (백엔드가 점수로 계산)
+  advance_ok: boolean; // 선행 가능 (선행 테스트 70점 이상일 때만 true)
+  staff_id: number; // 입력한 직원
+  memo: string;
+}
+
 // 변경 이력: 누가(고객/직원) · 언제 · 무엇을 · 어떻게 바꿨는지. 지우지 않고 쌓기만 한다
-export type LogEntity = "student" | "enrollment" | "attendance" | "makeup" | "payment" | "refund" | "class" | "staff";
+export type LogEntity = "student" | "enrollment" | "attendance" | "makeup" | "payment" | "refund" | "class" | "staff" | "level_test";
 export type LogAction = "create" | "update" | "end" | "cancel";
 export interface ActivityLog {
   id: number;
@@ -147,4 +167,5 @@ export interface DB {
   payments: Payment[];
   activity_logs: ActivityLog[];
   staff_tokens: StaffToken[];
+  level_tests: LevelTest[];
 }
