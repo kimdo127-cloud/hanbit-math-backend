@@ -7,7 +7,7 @@ export const TABLES: (keyof DB)[] = [
   "families",
   "parents",
   "students",
-  "student_contacts",
+  "family_contacts",
   "staff",
   "staff_tokens",
   "classes",
@@ -19,13 +19,14 @@ export const TABLES: (keyof DB)[] = [
   "payments",
   "activity_logs",
   "level_tests",
+  "invitations",
 ];
 
 // 시각(time)·일시(timestamp) 칸은 화면 코드가 쓰는 모양("17:00", "2026-10-29T16:50")으로 맞춘다
 const TIME_COLS = new Set(["start_time", "end_time", "checked_at"]);
-const TS_COLS: Record<string, string[]> = { staff_tokens: ["created_at", "expires_at", "used_at"], makeups: ["requested_at"], activity_logs: ["at"] };
+const TS_COLS: Record<string, string[]> = { invitations: ["created_at", "expires_at", "used_at", "revoked_at"], staff_tokens: ["created_at", "expires_at", "used_at"], makeups: ["requested_at"], activity_logs: ["at"] };
 
-// 표 15개를 왕복 한 번에 읽는다 (원격 DB에서 표마다 따로 읽으면 느리다)
+// 표 16개를 왕복 한 번에 읽는다 (원격 DB에서 표마다 따로 읽으면 느리다)
 export async function loadAll(client: PoolClient): Promise<DB> {
   const parts = TABLES.map((t) => `'${t}', (SELECT coalesce(json_agg(x ORDER BY x.id), '[]'::json) FROM ${t} x)`).join(", ");
   const { rows } = await client.query(`SELECT json_build_object(${parts}) AS db`);

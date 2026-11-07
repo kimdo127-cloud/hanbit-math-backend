@@ -1,19 +1,20 @@
-// 학부모 초대 코드: 학원이 보낸 초대 문자의 링크로만 가입하게 한다
-// 코드 = 보호자 번호를 서버 비밀값으로 서명한 값 (DB에 저장하지 않음). 번호마다 다르고, 비밀값 없이는 만들 수 없다
-import { createHmac, timingSafeEqual } from "crypto";
+// 학부모 초대 링크: 학원(직원)이 발급한 초대(invitations)의 코드로만 가입한다
+// 코드는 무작위 값. DB에는 해시만 저장하고 원문은 발급할 때 한 번만 돌려준다 (초대 문자에 넣음)
+import { createHash, randomBytes } from "crypto";
 
-const digits = (p: string) => p.replace(/[^0-9]/g, "");
+export const INVITE_HOURS = 72; // 3일
 
-export function inviteCode(phone: string) {
-  return createHmac("sha256", process.env.JWT_SECRET || "dev-only-secret")
-    .update(`parent-invite:${digits(phone)}`)
-    .digest("base64url")
-    .slice(0, 16);
+export function newInviteCode() {
+  return randomBytes(12).toString("base64url"); // 16자
+}
+export function hashInviteCode(code: string) {
+  return createHash("sha256").update(`parent-invite:${code.trim()}`).digest("hex");
 }
 
-export function isValidInvite(phone: string, code: string | undefined) {
-  if (!code) return false;
-  const a = Buffer.from(inviteCode(phone));
-  const b = Buffer.from(code.trim());
-  return a.length === b.length && timingSafeEqual(a, b);
+// "2026-10-29T16:50" + 시간 → 같은 모양
+export function addHours(at: string, hours: number) {
+  const d = new Date(at + ":00");
+  d.setHours(d.getHours() + hours);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }

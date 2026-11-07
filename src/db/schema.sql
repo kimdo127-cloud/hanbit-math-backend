@@ -5,7 +5,7 @@
 CREATE SCHEMA IF NOT EXISTS __SCHEMA__;
 SET search_path TO __SCHEMA__;
 
-DROP TABLE IF EXISTS chat_logs, level_tests, activity_logs, staff_tokens, payments, makeups, attendances, class_sessions, enrollments, class_schedules, classes, staff, student_contacts, students, parents, families CASCADE;
+DROP TABLE IF EXISTS chat_logs, invitations, family_contacts, level_tests, activity_logs, staff_tokens, payments, makeups, attendances, class_sessions, enrollments, class_schedules, classes, staff, student_contacts, students, parents, families CASCADE;
 
 -- 가족: 형제를 묶는 단위 (둘째 할인)
 CREATE TABLE families (
@@ -32,12 +32,16 @@ CREATE TABLE students (
   birth_date date NOT NULL
 );
 
-CREATE TABLE student_contacts (
+-- 보호자 연락처: 가족 단위로 한 번만 (형제가 같은 번호를 공유). 대표 번호는 가족마다 하나 = 초대 문자를 받는 번호
+CREATE TABLE family_contacts (
   id integer PRIMARY KEY,
-  student_id integer NOT NULL REFERENCES students(id),
+  family_id integer NOT NULL REFERENCES families(id),
   relation text NOT NULL,
-  phone text NOT NULL CHECK (phone ~ '^[0-9-]{9,13}$')
+  phone text NOT NULL CHECK (phone ~ '^[0-9-]{9,13}$'),
+  is_primary boolean NOT NULL DEFAULT false,
+  UNIQUE (family_id, phone)
 );
+CREATE UNIQUE INDEX family_contacts_one_primary ON family_contacts (family_id) WHERE is_primary;
 
 -- 직원 계정 (어드민). 권한 등급: 관리자·매니저·멤버
 CREATE TABLE staff (
@@ -139,6 +143,22 @@ CREATE TABLE payments (
   UNIQUE (student_id, class_id, month),
   CHECK ((paid_amount IS NULL) = (paid_at IS NULL))
 );
+
+-- 학부모 앱 초대: 직원이 발급해야 가입 가능. 3일 만료 · 1회용 · 다시 보내면 이전 초대 무효
+-- 코드 원문은 저장하지 않고 해시만. 살아 있는(쓰지도 무효되지도 않은) 초대는 가족마다 하나
+CREATE TABLE invitations (
+  id integer PRIMARY KEY,
+  family_id integer NOT NULL REFERENCES families(id),
+  phone text NOT NULL,
+  token_hash text NOT NULL UNIQUE,
+  created_by integer NOT NULL REFERENCES staff(id),
+  created_at timestamp NOT NULL,
+  expires_at timestamp NOT NULL CHECK (expires_at > created_at),
+  used_at timestamp,
+  revoked_at timestamp,
+  CHECK (used_at IS NULL OR revoked_at IS NULL)
+);
+CREATE UNIQUE INDEX invitations_one_live ON invitations (family_id) WHERE used_at IS NULL AND revoked_at IS NULL;
 
 -- 레벨테스트: 반 편성 근거. 정기(2월·8월) · 입학 · 선행. 쪽지시험은 기록하지 않는다
 -- 판정(result_level)은 백엔드가 점수로 계산해 넣는다. 영역 점수 범위와 합계는 DB가 지킨다

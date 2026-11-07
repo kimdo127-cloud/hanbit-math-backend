@@ -15,7 +15,7 @@ export interface Parent {
   email: string; // UNIQUE
   password_hash: string;
   name: string;
-  created_at: string; // 연락처는 student_contacts에만 저장
+  created_at: string; // 연락처는 family_contacts에만 저장
 }
 
 export interface Student {
@@ -27,11 +27,28 @@ export interface Student {
   birth_date: string; // 형제 순서(둘째 할인) 기준
 }
 
-export interface StudentContact {
+// 보호자 연락처: 가족 단위로 한 번만 저장 (형제가 같은 번호를 공유 → 원천은 하나)
+// 대표 번호(is_primary)는 가족마다 하나: 학부모 앱 초대 문자를 받는 번호
+export interface FamilyContact {
   id: number;
-  student_id: number;
+  family_id: number;
   relation: string; // 엄마, 아빠 …
-  phone: string;
+  phone: string; // UNIQUE(family_id, phone)
+  is_primary: boolean;
+}
+
+// 학부모 앱 초대: 학원(직원)이 발급해야만 가입할 수 있다. 대표 번호로 보내고 3일 뒤 만료, 한 번만 쓴다
+// 다시 보내면 이전 초대는 무효(revoked). 링크의 코드 원문은 저장하지 않고 해시만 저장
+export interface Invitation {
+  id: number;
+  family_id: number;
+  phone: string; // 보낸 번호 (그때 기준으로 저장)
+  token_hash: string;
+  created_by: number; // 발급한 직원
+  created_at: string; // "2026-10-29T16:50"
+  expires_at: string;
+  used_at: string | null; // 가입에 쓴 시각
+  revoked_at: string | null; // 새 초대를 보내 무효가 된 시각
 }
 
 export interface Staff {
@@ -138,7 +155,7 @@ export interface LevelTest {
 }
 
 // 변경 이력: 누가(고객/직원) · 언제 · 무엇을 · 어떻게 바꿨는지. 지우지 않고 쌓기만 한다
-export type LogEntity = "student" | "enrollment" | "attendance" | "makeup" | "payment" | "refund" | "class" | "staff" | "level_test";
+export type LogEntity = "student" | "enrollment" | "attendance" | "makeup" | "payment" | "refund" | "class" | "staff" | "level_test" | "contact" | "invitation";
 export type LogAction = "create" | "update" | "end" | "cancel";
 export interface ActivityLog {
   id: number;
@@ -156,7 +173,7 @@ export interface DB {
   families: Family[];
   parents: Parent[];
   students: Student[];
-  student_contacts: StudentContact[];
+  family_contacts: FamilyContact[];
   staff: Staff[];
   classes: ClassRoom[];
   class_schedules: ClassSchedule[];
@@ -168,4 +185,5 @@ export interface DB {
   activity_logs: ActivityLog[];
   staff_tokens: StaffToken[];
   level_tests: LevelTest[];
+  invitations: Invitation[];
 }

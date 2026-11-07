@@ -14,7 +14,7 @@ import {
   type PaymentRow,
 } from "./calc";
 import { checkPw, mockHash, TODAY } from "./seed";
-import { inviteCode } from "./invite";
+import { addHours, hashInviteCode, INVITE_HOURS, newInviteCode } from "./invite";
 import { ADVANCE_PASS, canAdvance, judgeLevel, latestPlacement, LEVEL_MAX, LEVEL_TEST_KIND_LABEL, nextRegularTest } from "./level";
 import { getSessionStaffId, loadDB, nextId, saveDB, setSessionStaffId } from "../db/store";
 import type { ActivityLog, AttendanceStatus, ClassLevel, ClassRoom, ClassSchedule, DB, Grade, LevelTest, LevelTestKind, Staff, Student } from "./types";
@@ -447,7 +447,8 @@ export async function getStudentDetail(id: number, month = currentMonth()) {
     student: s,
     siblings,
     parent: db.parents.find((p) => p.family_id === s.family_id) ?? null,
-    contacts: db.student_contacts.filter((c) => c.student_id === id),
+    contacts: db.family_contacts.filter((c) => c.family_id === s.family_id).sort((a, b) => Number(b.is_primary) - Number(a.is_primary) || a.id - b.id),
+    invite: inviteStatus(db, s.family_id),
     enrollments: db.enrollments
       .filter((e) => e.student_id === id)
       .sort((a, b) => Number(a.end_date !== null) - Number(b.end_date !== null))
@@ -481,8 +482,9 @@ export async function updateStudent(id: number, input: { name: string; grade: Gr
   saveDB(db);
 }
 
-// 학생 등록 (상담 후 학원이 한다). 보호자 번호가 학부모 앱 가입의 열쇠가 된다
-// 이미 등록된 보호자 번호면 그 가족에 붙인다 (형제 → 둘째 할인)
+// 학생 등록 (상담 후 학원이 한다). 보호자 번호는 가족 단위로 저장 (형제가 공유)
+// 이미 등록된 보호자 번호면 그 가족에 붙인다 (형제 → 둘째 할인). 새 가족이면 첫 번호가 대표 번호
+// 가족이 아직 앱에 가입하지 않았으면 대표 번호로 초대를 발급한다 (초대 문자에 넣을 링크 코드를 한 번만 돌려준다)
 export async function createStudent(input: { name: string; grade: Grade; school: string; birth_date: string; guardians: { relation: string; phone: string }[] }) {
   await wait();
   const me = requireManager();
@@ -490,25 +492,113 @@ export async function createStudent(input: { name: string; grade: Grade; school:
   const guardians = input.guardians.map((g) => ({ relation: g.relation.trim(), phone: g.phone.trim() })).filter((g) => g.relation || g.phone);
   if (guardians.length === 0) throw new ApiError("보호자 연락처를 한 개 이상 넣어 주세요. 학부모 앱 가입에 쓰여요.");
   if (guardians.some((g) => !g.relation || !/^[0-9-]{9,13}$/.test(g.phone))) throw new ApiError("보호자 관계와 휴대폰 번호를 확인해 주세요.");
+  if (new Set(guardians.map((g) => digits(g.phone))).size < guardians.length) throw new ApiError("같은 번호를 두 번 넣었어요.");
   const db = loadDB();
-  const digits = (p: string) => p.replace(/[^0-9]/g, "");
-  const linked = db.student_contacts.filter((c) => guardians.some((g) => digits(g.phone) === digits(c.phone)));
-  const known = linked[0];
-  const sameKid = db.students.find((s) => linked.some((c) => c.student_id === s.id) && s.name === input.name.trim());
+  const linked = db.family_contacts.filter((c) => guardians.some((g) => digits(g.phone) === digits(c.phone)));
+  if (new Set(linked.map((c) => c.family_id)).size > 1) throw new ApiError("서로 다른 가족에 등록된 번호가 섞여 있어요. 번호를 확인해 주세요.");
+  let familyId = linked[0]?.family_id ?? null;
+  const sameKid = familyId !== null ? db.students.find((s) => s.family_id === familyId && s.name === input.name.trim()) : undefined;
   if (sameKid) throw new ApiError(`${sameKid.name} 학생은 이미 등록되어 있어요.`, 409);
-  let familyId = known ? db.students.find((s) => s.id === known.student_id)!.family_id : null;
+  const isNewFamily = familyId === null;
   if (familyId === null) {
     familyId = nextId(db.families);
     db.families.push({ id: familyId, name: `${input.name.trim()} 가족` });
   }
   const sid = nextId(db.students);
   db.students.push({ id: sid, family_id: familyId, name: input.name.trim(), grade: input.grade, school: input.school.trim(), birth_date: input.birth_date });
-  guardians.forEach((g) => db.student_contacts.push({ id: nextId(db.student_contacts), student_id: sid, relation: g.relation, phone: g.phone }));
-  const sibling = known ? db.students.find((s) => s.id === known.student_id)!.name : null;
+  // 가족에 없는 번호만 추가 (원천은 하나)
+  guardians.forEach((g, i) => {
+    if (!db.family_contacts.some((c) => c.family_id === familyId && digits(c.phone) === digits(g.phone)))
+      db.family_contacts.push({ id: nextId(db.family_contacts), family_id: familyId!, relation: g.relation, phone: g.phone, is_primary: isNewFamily && i === 0 });
+  });
+  const sibling = isNewFamily ? null : db.students.find((s) => s.family_id === familyId && s.id !== sid)?.name ?? null;
   addLog(db, me, sid, "student", "create", `학생 등록: ${input.name.trim()} · ${GRADE_LABEL[input.grade]} · ${input.school.trim()}${sibling ? ` (${sibling} 학생과 같은 가족)` : ""}`);
+  const joined = db.parents.some((p) => p.family_id === familyId);
+  const invite = joined ? null : issueInvitation(db, me, familyId, sid);
   saveDB(db);
-  // 초대 문자에 넣을 가입 링크 코드 (보호자 번호마다 하나)
-  return { id: sid, sibling, invites: guardians.map((g) => ({ relation: g.relation, phone: g.phone, code: inviteCode(g.phone) })) };
+  return { id: sid, sibling, joined, invite };
+}
+
+/* ---------- 학부모 앱 초대 ----------
+ * 학원(직원)이 발급해야만 가입할 수 있다. 대표 번호로 보내고 3일 뒤 만료, 한 번만 쓴다
+ * 다시 보내면 이전 초대는 무효 → 실수로 두 번 보내도 마지막 링크만 쓸 수 있다
+ */
+const digits = (p: string) => p.replace(/[^0-9]/g, "");
+export type InviteState = "joined" | "active" | "expired" | "none";
+function inviteStatus(db: DB, familyId: number): { state: InviteState; phone: string | null; sentAt: string | null; expiresAt: string | null; usedAt: string | null } {
+  const last = db.invitations.filter((x) => x.family_id === familyId && !x.revoked_at).sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id)[0];
+  const joined = db.parents.some((p) => p.family_id === familyId);
+  const state: InviteState = joined ? "joined" : !last ? "none" : last.expires_at < mockNow() ? "expired" : "active";
+  return { state, phone: last?.phone ?? null, sentAt: last?.created_at ?? null, expiresAt: last?.expires_at ?? null, usedAt: last?.used_at ?? null };
+}
+function issueInvitation(db: DB, me: Staff, familyId: number, studentId: number) {
+  const primary = db.family_contacts.find((c) => c.family_id === familyId && c.is_primary);
+  if (!primary) throw new ApiError("대표 번호가 없어요. 연락처에서 대표 번호를 먼저 정해 주세요.");
+  const now = mockNow();
+  const live = db.invitations.filter((x) => x.family_id === familyId && !x.used_at && !x.revoked_at);
+  live.forEach((x) => (x.revoked_at = now)); // 이전 초대 무효
+  const code = newInviteCode();
+  const expires_at = addHours(now, INVITE_HOURS);
+  db.invitations.push({ id: nextId(db.invitations), family_id: familyId, phone: primary.phone, token_hash: hashInviteCode(code), created_by: me.id, created_at: now, expires_at, used_at: null, revoked_at: null });
+  addLog(db, me, studentId, "invitation", "create", `학부모 앱 초대 ${live.length ? "다시 보냄" : "보냄"}: ${primary.relation} ${primary.phone} (${md(expires_at.slice(0, 10))} ${expires_at.slice(11)}까지)${live.length ? " · 이전 링크 무효" : ""}`);
+  return { phone: primary.phone, relation: primary.relation, code, expiresAt: expires_at };
+}
+
+// 학생 상세 > [초대 보내기] / [다시 보내기]
+export async function sendParentInvite(studentId: number) {
+  await wait();
+  const me = requireManager();
+  const db = loadDB();
+  const s = db.students.find((x) => x.id === studentId);
+  if (!s) throw new ApiError("없는 학생이에요.", 404);
+  if (db.parents.some((p) => p.family_id === s.family_id)) throw new ApiError("이미 앱에 가입한 가족이에요.", 409);
+  const r = issueInvitation(db, me, s.family_id, s.id);
+  saveDB(db);
+  return r;
+}
+
+// 대표 번호 바꾸기: 살아 있는 초대는 예전 번호로 나갔으므로 무효로 한다
+export async function setPrimaryContact(contactId: number) {
+  await wait();
+  const me = requireManager();
+  const db = loadDB();
+  const c = db.family_contacts.find((x) => x.id === contactId);
+  if (!c) throw new ApiError("없는 연락처예요.", 404);
+  if (c.is_primary) return;
+  db.family_contacts.filter((x) => x.family_id === c.family_id).forEach((x) => (x.is_primary = x.id === c.id));
+  const now = mockNow();
+  const live = db.invitations.filter((x) => x.family_id === c.family_id && !x.used_at && !x.revoked_at);
+  live.forEach((x) => (x.revoked_at = now));
+  const sid = db.students.find((x) => x.family_id === c.family_id)?.id ?? null;
+  addLog(db, me, sid, "contact", "update", `대표 번호 변경: ${c.relation} ${c.phone}${live.length ? " · 예전 번호로 보낸 초대 무효" : ""}`);
+  saveDB(db);
+}
+
+// 가입 전 번호를 잘못 넣었을 때 학원이 고친다 (가입 후에는 보호자가 앱에서 관리)
+export async function addContactByStaff(studentId: number, relation: string, phone: string) {
+  await wait();
+  const me = requireManager();
+  if (!relation.trim() || !/^[0-9-]{9,13}$/.test(phone.trim())) throw new ApiError("관계와 휴대폰 번호를 확인해 주세요.");
+  const db = loadDB();
+  const s = db.students.find((x) => x.id === studentId);
+  if (!s) throw new ApiError("없는 학생이에요.", 404);
+  if (db.family_contacts.some((c) => c.family_id === s.family_id && digits(c.phone) === digits(phone))) throw new ApiError("이미 등록된 번호예요.", 409);
+  const first = !db.family_contacts.some((c) => c.family_id === s.family_id);
+  db.family_contacts.push({ id: nextId(db.family_contacts), family_id: s.family_id, relation: relation.trim(), phone: phone.trim(), is_primary: first });
+  addLog(db, me, s.id, "contact", "create", `연락처 추가: ${relation.trim()} ${phone.trim()}`);
+  saveDB(db);
+}
+
+export async function removeContactByStaff(contactId: number) {
+  await wait();
+  const me = requireManager();
+  const db = loadDB();
+  const c = db.family_contacts.find((x) => x.id === contactId);
+  if (!c) return;
+  if (c.is_primary) throw new ApiError("대표 번호는 지울 수 없어요. 다른 번호를 대표로 바꾼 뒤 지워 주세요.");
+  db.family_contacts = db.family_contacts.filter((x) => x.id !== contactId);
+  addLog(db, me, db.students.find((x) => x.family_id === c.family_id)?.id ?? null, "contact", "cancel", `연락처 삭제: ${c.relation} ${c.phone}`);
+  saveDB(db);
 }
 
 export async function endEnrollment(enrollmentId: number, endDate: string) {
@@ -938,7 +1028,9 @@ export async function kioskLookup(last4: string): Promise<KioskCandidate[]> {
   requireStaff(); // 키오스크 태블릿은 직원 계정으로 로그인해 둔다
   if (!/^\d{4}$/.test(last4)) throw new ApiError("번호 4자리를 눌러 주세요.");
   const db = loadDB();
-  const ids = [...new Set(db.student_contacts.filter((c) => c.phone.replace(/\D/g, "").endsWith(last4)).map((c) => c.student_id))];
+  // 보호자 번호(가족 단위) 뒷자리 → 그 가족의 학생들
+  const families = new Set(db.family_contacts.filter((c) => c.phone.replace(/\D/g, "").endsWith(last4)).map((c) => c.family_id));
+  const ids = db.students.filter((x) => families.has(x.family_id)).map((x) => x.id);
   return ids.flatMap((id) => {
     const st = db.students.find((x) => x.id === id)!;
     return todaySessionsFor(db, id).map(({ x, makeup }) => {
