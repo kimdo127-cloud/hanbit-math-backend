@@ -8,6 +8,7 @@ import { sign, verify } from "jsonwebtoken";
 import { pool, SCHEMA } from "./db/pool";
 import { runRequest } from "./db/store";
 import { setupDB } from "./db/setup";
+import { hasPushSubscription, removePushSubscription, savePushSubscription, sendPush } from "./push";
 import * as adminApi from "./logic/admin-api";
 import * as webApi from "./logic/web-api";
 
@@ -29,6 +30,7 @@ const DB_RULES: Record<string, string> = {
   class_schedules_check: "끝 시각은 시작 시각보다 늦어야 해요. (DB가 막음)",
   family_contacts_family_id_phone_key: "이 가족에 이미 등록된 번호예요. (DB가 막음)",
   family_contacts_one_primary: "대표 번호는 가족마다 하나만 정할 수 있어요. (DB가 막음)",
+  students_kiosk_code_key: "이미 다른 학생이 쓰는 출석 번호예요. (DB가 막음)",
   invitations_one_live: "이 가족에게 아직 쓸 수 있는 초대가 있어요. (DB가 막음)",
   level_tests_check: "레벨테스트 합계 점수가 영역 점수의 합과 달라요. (DB가 막음)",
   level_tests_student_id_kind_tested_on_key: "같은 날 같은 종류의 레벨테스트 기록이 이미 있어요. (DB가 막음)",
@@ -144,6 +146,14 @@ export class ApiController {
     // 규정 묻기: 화면 → 백엔드 → Dify. Dify 키는 백엔드 설정값에만 둔다 (브라우저에 두면 누구나 꺼내 씀)
     if (app === "web" && fn === "askRegulation") return { data: await this.askRegulation(auth, body?.args?.[0]) };
     if (app === "admin" && fn === "listChatLogs") return { data: await this.listChatLogs(auth) };
+    // 앱 푸시 구독: 업무 데이터가 아니라 따로 저장 (요청마다 불러오지 않음)
+    if (app === "web" && ["savePushSubscription", "removePushSubscription", "getPushStatus"].includes(fn)) {
+      const who = verifyWho(auth);
+      if (who?.t !== "parent") throw new HttpException({ message: "로그인이 필요해요." }, 401);
+      if (fn === "savePushSubscription") await savePushSubscription(who.id, body?.args?.[0]).catch(() => { throw new HttpException({ message: "알림을 켜지 못했어요. 다시 시도해 주세요." }, 400); });
+      if (fn === "removePushSubscription") await removePushSubscription(who.id, String(body?.args?.[0] ?? ""));
+      return { data: fn === "getPushStatus" ? await hasPushSubscription(who.id) : true };
+    }
 
     const mod = APIS[app];
     const f = mod?.[fn];
@@ -167,6 +177,8 @@ export class ApiController {
       const newId = app === "web" ? out.parentId : out.staffId;
       const oldId = app === "web" ? parentId : staffId;
       const token = newId && newId !== oldId ? sign({ t: app === "web" ? "parent" : "staff", id: newId } satisfies Who, SECRET, { expiresIn: "7d" }) : undefined;
+      // 새 알림은 응답을 기다리게 하지 않고 뒤에서 푸시로 보낸다
+      if (out.notifications.length) void sendPush(out.notifications).catch((e) => console.error("push", e));
       return { data: out.result ?? null, token };
     } catch (e) {
       const err = e as { status?: number; message?: string; code?: string; constraint?: string };

@@ -56,6 +56,7 @@ export interface AttendanceRow {
   className: string;
   status: AttendanceStatus;
   checkedAt: string | null; // 등원 시각
+  leftAt: string | null; // 하원 시각
   topic: string | null; // 수업 내용
   startTime: string; // 수업 시작 시각
   lateMin: number; // 지각이면 몇 분 늦었는지
@@ -91,6 +92,7 @@ export function attendanceRows(db: DB, studentId: number, month: string): Attend
         className: db.classes.find((c) => c.id === s.class_id)!.name,
         status: a.status,
         checkedAt: a.checked_at,
+        leftAt: a.left_at,
         topic: s.topic,
         startTime: sessionStart(db, s),
         lateMin: a.status === "late" && a.checked_at ? toMin(a.checked_at) - toMin(sessionStart(db, s)) : 0,

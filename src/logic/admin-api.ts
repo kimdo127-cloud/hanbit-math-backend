@@ -15,7 +15,9 @@ import {
 } from "./calc";
 import { checkPw, mockHash, TODAY } from "./seed";
 import { addHours, hashInviteCode, INVITE_HOURS, newInviteCode } from "./invite";
-import { ADVANCE_PASS, canAdvance, judgeLevel, latestPlacement, LEVEL_MAX, LEVEL_TEST_KIND_LABEL, nextRegularTest } from "./level";
+import { notify } from "./notify";
+import { draftComment } from "./comment-ai";
+import { ADVANCE_PASS, canAdvance, judgeLevel, latestPlacement, LEVEL_MAX, LEVEL_TEST_KIND_LABEL, nextRegularTest, regularTestDates } from "./level";
 import { getSessionStaffId, loadDB, nextId, saveDB, setSessionStaffId } from "../db/store";
 import type { ActivityLog, AttendanceStatus, ClassLevel, ClassRoom, ClassSchedule, DB, Grade, LevelTest, LevelTestKind, Staff, Student } from "./types";
 
@@ -413,6 +415,7 @@ export interface StudentRow {
   attendance: AttendanceSummary;
   unpaid: number;
   level: string | null; // 최근 레벨테스트 판정 (정기·입학)
+  appJoined: boolean; // 학부모 앱 가입 여부 (가족 단위)
 }
 
 export async function listStudents(month = currentMonth()): Promise<StudentRow[]> {
@@ -431,6 +434,7 @@ export async function listStudents(month = currentMonth()): Promise<StudentRow[]
       attendance: attendanceSummary(db, s.id, month),
       unpaid: paymentRows(db, s, month).filter((p) => p.status === "unpaid").reduce((t, p) => t + p.amount, 0),
       level: latestPlacement(db, s.id)?.result_level ?? null,
+      appJoined: db.parents.some((p) => p.family_id === s.family_id),
       };
     })
     .sort((a, b) => Number(b.active) - Number(a.active) || a.student.grade - b.student.grade || a.student.name.localeCompare(b.student.name));
@@ -485,10 +489,12 @@ export async function updateStudent(id: number, input: { name: string; grade: Gr
 // 학생 등록 (상담 후 학원이 한다). 보호자 번호는 가족 단위로 저장 (형제가 공유)
 // 이미 등록된 보호자 번호면 그 가족에 붙인다 (형제 → 둘째 할인). 새 가족이면 첫 번호가 대표 번호
 // 가족이 아직 앱에 가입하지 않았으면 대표 번호로 초대를 발급한다 (초대 문자에 넣을 링크 코드를 한 번만 돌려준다)
-export async function createStudent(input: { name: string; grade: Grade; school: string; birth_date: string; guardians: { relation: string; phone: string }[] }) {
+export async function createStudent(input: { name: string; grade: Grade; school: string; birth_date: string; kioskCode: string; guardians: { relation: string; phone: string }[] }) {
   await wait();
   const me = requireManager();
   if (!input.name.trim() || !input.school.trim() || !input.birth_date) throw new ApiError("이름, 학교, 생년월일을 확인해 주세요.");
+  const code = (input.kioskCode ?? "").trim();
+  checkKioskCode(loadDB(), code, null);
   const guardians = input.guardians.map((g) => ({ relation: g.relation.trim(), phone: g.phone.trim() })).filter((g) => g.relation || g.phone);
   if (guardians.length === 0) throw new ApiError("보호자 연락처를 한 개 이상 넣어 주세요. 학부모 앱 가입에 쓰여요.");
   if (guardians.some((g) => !g.relation || !/^[0-9-]{9,13}$/.test(g.phone))) throw new ApiError("보호자 관계와 휴대폰 번호를 확인해 주세요.");
@@ -505,7 +511,7 @@ export async function createStudent(input: { name: string; grade: Grade; school:
     db.families.push({ id: familyId, name: `${input.name.trim()} 가족` });
   }
   const sid = nextId(db.students);
-  db.students.push({ id: sid, family_id: familyId, name: input.name.trim(), grade: input.grade, school: input.school.trim(), birth_date: input.birth_date });
+  db.students.push({ id: sid, family_id: familyId, name: input.name.trim(), grade: input.grade, school: input.school.trim(), birth_date: input.birth_date, kiosk_code: code });
   // 가족에 없는 번호만 추가 (원천은 하나)
   guardians.forEach((g, i) => {
     if (!db.family_contacts.some((c) => c.family_id === familyId && digits(c.phone) === digits(g.phone)))
@@ -517,6 +523,27 @@ export async function createStudent(input: { name: string; grade: Grade; school:
   const invite = joined ? null : issueInvitation(db, me, familyId, sid);
   saveDB(db);
   return { id: sid, sibling, joined, invite };
+}
+
+// 출석 번호: 4자리 숫자, 학생마다 하나 (최종: DB UNIQUE)
+function checkKioskCode(db: DB, code: string, studentId: number | null) {
+  if (!/^\d{4}$/.test(code)) throw new ApiError("출석 번호는 숫자 4자리로 정해 주세요.");
+  const used = db.students.find((s) => s.kiosk_code === code && s.id !== studentId);
+  if (used) throw new ApiError("이미 다른 학생이 쓰는 출석 번호예요. 다른 번호로 정해 주세요.", 409);
+}
+
+export async function setKioskCode(studentId: number, code: string) {
+  await wait();
+  const me = requireManager();
+  const db = loadDB();
+  const s = db.students.find((x) => x.id === studentId);
+  if (!s) throw new ApiError("없는 학생이에요.", 404);
+  const c = code.trim();
+  checkKioskCode(db, c, s.id);
+  if (s.kiosk_code === c) return;
+  addLog(db, me, s.id, "student", "update", `출석 번호 변경: ${s.kiosk_code} → ${c}`);
+  s.kiosk_code = c;
+  saveDB(db);
 }
 
 /* ---------- 학부모 앱 초대 ----------
@@ -631,6 +658,7 @@ export interface SheetRow {
   status: AttendanceStatus | null;
   checkedAt: string | null;
   source: "kiosk" | "staff" | null;
+  leftAt: string | null; // 하원 시각
   offGrade: boolean;
 }
 
@@ -647,7 +675,7 @@ export async function getAttendanceSheet(classId: number, date: string) {
     .map((e) => {
       const s = db.students.find((x) => x.id === e.student_id)!;
       const a = db.attendances.find((x) => x.session_id === session.id && x.student_id === s.id);
-      return { student: s, status: a?.status ?? null, checkedAt: a?.checked_at ?? null, source: a?.source ?? null, offGrade: s.grade !== cls.target_grade };
+      return { student: s, status: a?.status ?? null, checkedAt: a?.checked_at ?? null, source: a?.source ?? null, leftAt: a?.left_at ?? null, offGrade: s.grade !== cls.target_grade };
     })
     .sort((a, b) => a.student.name.localeCompare(b.student.name));
   // 이 수업에 보강으로 들어오는 학생 (보강 → 결석 기록 → 학생)
@@ -665,6 +693,12 @@ export async function getAttendanceSheet(classId: number, date: string) {
 // 등원 시각으로 지각을 정한다 (강좌 시작 시각보다 늦으면 지각)
 export function statusByTime(start: string, checkedAt: string): AttendanceStatus {
   return toMin(checkedAt) > toMin(start) ? "late" : "present";
+}
+
+// 결석 처리 → 학부모 알림 (보강 신청으로 이어지게)
+function absentNotice(db: DB, studentId: number, date: string, className: string) {
+  const s = db.students.find((x) => x.id === studentId)!;
+  notify(db, { family_id: s.family_id, student_id: s.id, kind: "absent", title: `${s.name.slice(1)} 결석`, body: `${md(date)}(${WEEKDAY[new Date(date + "T00:00").getDay()]}) ${className} 수업에 오지 않았어요. 보강을 신청할 수 있어요.`, link: "/makeup" });
 }
 
 export async function saveAttendance(sessionId: number, entries: { studentId: number; status: AttendanceStatus; checkedAt: string | null }[]) {
@@ -689,8 +723,13 @@ export async function saveAttendance(sessionId: number, entries: { studentId: nu
       if (a.status === value.status && a.checked_at === value.checked_at) continue;
       // 처음 입력은 이력에 남기지 않고, 이미 있던 출결을 바꿀 때만 남긴다
       addLog(db, me, studentId, "attendance", "update", `출결 수정 ${md(session.date)} ${cls.name}: ${label(a.status, a.checked_at)} → ${label(value.status, value.checked_at)}`);
-      Object.assign(a, value);
-    } else db.attendances.push({ id: nextId(db.attendances), session_id: sessionId, student_id: studentId, ...value });
+      const wasAbsent = a.status === "absent";
+      Object.assign(a, value, value.status === "absent" ? { left_at: null } : {});
+      if (value.status === "absent" && !wasAbsent) absentNotice(db, studentId, session.date, cls.name);
+    } else {
+      db.attendances.push({ id: nextId(db.attendances), session_id: sessionId, student_id: studentId, ...value, left_at: null });
+      if (value.status === "absent") absentNotice(db, studentId, session.date, cls.name);
+    }
   }
   saveDB(db);
 }
@@ -797,6 +836,9 @@ export async function createMakeup(attendanceId: number, sessionId: number) {
     throw new ApiError(`${cls.name} ${Number(target.date.slice(5, 7))}월 ${Number(target.date.slice(8))}일 수업은 원래 ${regular}명 + 보강 ${makeups}명으로 정원 ${cls.capacity}명이 찼어요.`, 409);
   db.makeups.push({ id: nextId(db.makeups), absence_id: attendanceId, session_id: sessionId, requested_at: `${TODAY}T${new Date().toTimeString().slice(0, 5)}` });
   addLog(db, me, abs.student_id, "makeup", "create", `보강 대신 신청: ${md(absSess.date)} 결석분 → ${md(target.date)} ${cls.name} (전화 요청)`);
+  const st = db.students.find((x) => x.id === abs.student_id)!;
+  const sch = db.class_schedules.find((c) => c.class_id === cls.id && c.weekday === new Date(target.date + "T00:00").getDay());
+  notify(db, { family_id: st.family_id, student_id: st.id, kind: "makeup", title: `${st.name.slice(1)} 보강이 확정됐어요`, body: `${md(target.date)}(${WEEKDAY[new Date(target.date + "T00:00").getDay()]}) ${cls.name}${sch ? ` ${sch.start_time}` : ""} · ${md(absSess.date)} 결석분`, link: "/makeup" });
   saveDB(db);
 }
 
@@ -942,12 +984,22 @@ export async function markRefunded(enrollmentId: number, amount: number, date: s
 
 /* ---------- 대시보드 ---------- */
 
+export interface DashboardTask {
+  key: string;
+  label: string; // "결석 처리 2건" — 항목 자체가 제목
+  detail: string;
+  href: string;
+  urgent: boolean; // 기한이 지났거나 지금 처리해야 하는 일 → 빨간색
+}
+
 export async function getDashboard() {
   await wait();
   const me = requireStaff();
   const db = loadDB();
   const month = currentMonth();
+  const member = me.role === "member";
   const wd = new Date(TODAY + "T00:00").getDay();
+  const nowHM = new Date().toTimeString().slice(0, 5);
   const todayClasses = db.class_schedules
     .filter((s) => s.weekday === wd)
     .map((s) => ({ s, c: db.classes.find((c) => c.id === s.class_id)! }))
@@ -974,29 +1026,73 @@ export async function getDashboard() {
         missing: Math.max(0, expected - atts.filter((a) => db.enrollments.some((e) => e.student_id === a.student_id && e.class_id === c.id)).length),
       };
     });
+
+  // 처리할 일: 있을 때만 한 줄씩. 누르면 처리 화면으로
+  const tasks: DashboardTask[] = [];
+  const needAbsent = todayClasses.filter((c) => c.missing > 0 && nowHM >= c.start);
+  if (needAbsent.length)
+    tasks.push({ key: "absent", label: `결석 처리 ${needAbsent.reduce((t, c) => t + c.missing, 0)}명`, detail: needAbsent.map((c) => c.name).join(", "), href: `/attendance?class=${needAbsent[0].classId}&date=${TODAY}`, urgent: true });
+  const makeupToday = todayClasses.reduce((t, c) => t + c.makeupIn, 0);
+  if (makeupToday) tasks.push({ key: "makeup-in", label: `오늘 보강 ${makeupToday}명`, detail: todayClasses.filter((c) => c.makeupIn).map((c) => `${c.name} ${c.makeupIn}명`).join(", "), href: "/makeups", urgent: false });
+  // 레벨테스트 입력: 정기 테스트 날부터 14일 동안, 담당 강좌에 결과가 없는 학생
+  const lastRegular = regularTestDates(Number(TODAY.slice(0, 4))).filter((d) => d <= TODAY).pop();
+  if (lastRegular && daysBetween(lastRegular, TODAY) <= 14) {
+    const missing = db.classes.filter((c) => visible(me, c)).flatMap((c) =>
+      db.enrollments.filter((e) => e.class_id === c.id && e.end_date === null && e.start_date <= lastRegular && !db.level_tests.some((t) => t.student_id === e.student_id && t.kind === "regular" && t.tested_on === lastRegular)).map(() => c),
+    );
+    if (missing.length) tasks.push({ key: "level", label: `레벨테스트 결과 입력 ${missing.length}명`, detail: `${md(lastRegular)} 정기 테스트`, href: `/classes/${missing[0].id}/level-test`, urgent: false });
+  }
+
   const unpaid = db.students.flatMap((s) => paymentRows(db, s, month).filter((p) => p.status === "unpaid"));
   const refundsDue = db.enrollments
     .filter((e) => e.end_date && !e.refunded_at)
-    .map((e) => {
-      const due = addDays(e.end_date!, REFUND_DAYS);
-      return { enrollmentId: e.id, name: db.students.find((s) => s.id === e.student_id)!.name, className: db.classes.find((c) => c.id === e.class_id)!.name, due, dLeft: daysBetween(TODAY, due), amount: refundCalc(db, { ...e, end_date: e.end_date! }).amount };
-    })
-    .sort((a, b) => a.due.localeCompare(b.due));
-  const makeupsUpcoming = db.makeups
-    .map((m) => ({ m, s: db.class_sessions.find((x) => x.id === m.session_id)! }))
-    .filter(({ s }) => s.date > TODAY && s.date <= addDays(TODAY, 7)).length;
-  const nearFull = db.classes
-    .map((c) => ({ name: c.name, left: c.capacity - activeCount(db, c.id) }))
-    .filter((c) => c.left <= 1)
-    .sort((a, b) => a.left - b.left);
-  // 멤버(강사)는 담당 강좌 수업만 보고, 수납·환불은 보지 않는다
-  const member = me.role === "member";
-  return { me: pub(me), month, today: TODAY, todayClasses, unpaid: member ? [] : unpaid, refundsDue: member ? [] : refundsDue, makeupsUpcoming, nearFull, member };
+    .map((e) => ({ due: addDays(e.end_date!, REFUND_DAYS) }))
+    .map((r) => ({ ...r, dLeft: daysBetween(TODAY, r.due) }));
+  let kpis: { label: string; value: string; sub: string; href: string }[] = [];
+  if (!member) {
+    if (refundsDue.length) {
+      const over = refundsDue.filter((r) => r.dLeft < 0).length;
+      const soon = Math.min(...refundsDue.map((r) => r.dLeft));
+      tasks.push({ key: "refund", label: `환불 처리 ${refundsDue.length}건`, detail: over ? `${over}건 기한 지남` : `가장 가까운 기한 D-${soon}`, href: "/payments?tab=refund", urgent: over > 0 });
+    }
+    if (unpaid.length) tasks.push({ key: "unpaid", label: `${Number(month.slice(5))}월 미납 ${new Set(unpaid.map((p) => p.studentId)).size}명`, detail: `${unpaid.reduce((t, p) => t + p.amount, 0).toLocaleString("ko-KR")}원`, href: "/payments", urgent: false });
+    const openMakeups = db.attendances.filter((a) => {
+      if (a.status !== "absent" || db.makeups.some((m) => m.absence_id === a.id)) return false;
+      const s = db.class_sessions.find((x) => x.id === a.session_id)!;
+      return s.date.slice(0, 7) === month;
+    }).length;
+    if (openMakeups) tasks.push({ key: "makeup", label: `보강 신청 전 결석 ${openMakeups}건`, detail: `${Number(month.slice(5))}월 말까지 신청 가능`, href: "/makeups", urgent: false });
+    const notJoined = db.families.filter((f) => db.students.some((s) => s.family_id === f.id && (db.enrollments.some((e) => e.student_id === s.id && e.end_date === null) || !db.enrollments.some((e) => e.student_id === s.id))) && !db.parents.some((p) => p.family_id === f.id));
+    const expired = notJoined.filter((f) => {
+      const last = db.invitations.filter((x) => x.family_id === f.id && !x.revoked_at).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+      return !last || last.expires_at < `${TODAY}T${nowHM}`;
+    }).length;
+    if (expired) tasks.push({ key: "invite", label: `앱 초대 필요 ${expired}가족`, detail: "초대 전이거나 링크 기간이 지났어요", href: "/students?only=invite", urgent: false });
+
+    // 이번 달 현황 (숫자 4개). 빨간색은 쓰지 않는다
+    const active = new Set(db.enrollments.filter((e) => e.start_date <= TODAY && (e.end_date === null || e.end_date > TODAY)).map((e) => e.student_id));
+    const { start: mStart, end: mEnd } = monthRange(month);
+    const newCount = new Set(db.enrollments.filter((e) => e.start_date >= mStart && e.start_date <= mEnd && !db.enrollments.some((x) => x.student_id === e.student_id && x.start_date < mStart)).map((e) => e.student_id)).size;
+    const endCount = new Set(db.enrollments.filter((e) => e.end_date && e.end_date >= mStart && e.end_date <= mEnd && !active.has(e.student_id)).map((e) => e.student_id)).size;
+    const bills = db.students.flatMap((s) => paymentRows(db, s, month));
+    const billed = bills.reduce((t, p) => t + p.amount, 0);
+    const paid = bills.filter((p) => p.status === "paid").reduce((t, p) => t + (p.paidAmount ?? p.amount), 0);
+    const monthAtts = db.attendances.filter((a) => { const s = db.class_sessions.find((x) => x.id === a.session_id)!; return s.date >= mStart && s.date <= TODAY; });
+    const rate = monthAtts.length ? Math.round((monthAtts.filter((a) => a.status !== "absent").length / monthAtts.length) * 100) : null;
+    const cap = db.classes.reduce((t, c) => t + c.capacity, 0);
+    kpis = [
+      { label: "재원생", value: `${active.size}명`, sub: `신규 ${newCount} · 중단 ${endCount}`, href: "/students" },
+      { label: `${Number(month.slice(5))}월 수납률`, value: billed ? `${Math.round((paid / billed) * 100)}%` : "-", sub: `미납 ${(billed - paid).toLocaleString("ko-KR")}원`, href: "/payments" },
+      { label: `${Number(month.slice(5))}월 출석률`, value: rate === null ? "-" : `${rate}%`, sub: `결석 ${monthAtts.filter((a) => a.status === "absent").length}건`, href: "/makeups" },
+      { label: "강좌 충원율", value: cap ? `${Math.round((active.size ? db.classes.reduce((t, c) => t + activeCount(db, c.id), 0) / cap : 0) * 100)}%` : "-", sub: `마감 ${db.classes.filter((c) => activeCount(db, c.id) >= c.capacity).length}개 강좌`, href: "/classes" },
+    ];
+  }
+  return { me: pub(me), month, today: TODAY, todayClasses, tasks, kpis, member };
 }
 
-/* ---------- 등원 키오스크 (입구 태블릿, 학생이 직접) ----------
- * 보호자 연락처 뒷자리 4자리 → 오늘 수업이 있는 학생 → 이름 눌러 등원
- * 등원 시각은 누른 시각, 강좌 시작보다 늦으면 자동 지각. 보호자에게 등원 알림(목업에서는 표시만)
+/* ---------- 등원·하원 키오스크 (입구 태블릿, 학생이 직접) ----------
+ * 학생 출석 번호 4자리 → 이름 확인 → 등원 또는 하원. 출석 번호는 학생마다 하나라 항상 한 명만 나온다
+ * 등원 시각은 누른 시각, 강좌 시작보다 늦으면 자동 지각. 등원·하원 모두 학부모에게 알림
  */
 export interface KioskCandidate {
   studentId: number;
@@ -1006,6 +1102,7 @@ export interface KioskCandidate {
   className: string;
   start: string;
   checkedAt: string | null; // 이미 등원했으면 시각
+  leftAt: string | null; // 이미 하원했으면 시각
   makeup: boolean; // 보강으로 오는 수업
 }
 
@@ -1023,20 +1120,16 @@ function todaySessionsFor(db: DB, studentId: number) {
   return [...regular, ...makeups];
 }
 
-export async function kioskLookup(last4: string): Promise<KioskCandidate[]> {
+export async function kioskLookup(code: string): Promise<KioskCandidate[]> {
   await wait();
   requireStaff(); // 키오스크 태블릿은 직원 계정으로 로그인해 둔다
-  if (!/^\d{4}$/.test(last4)) throw new ApiError("번호 4자리를 눌러 주세요.");
+  if (!/^\d{4}$/.test(code)) throw new ApiError("출석 번호 4자리를 눌러 주세요.");
   const db = loadDB();
-  // 보호자 번호(가족 단위) 뒷자리 → 그 가족의 학생들
-  const families = new Set(db.family_contacts.filter((c) => c.phone.replace(/\D/g, "").endsWith(last4)).map((c) => c.family_id));
-  const ids = db.students.filter((x) => families.has(x.family_id)).map((x) => x.id);
-  return ids.flatMap((id) => {
-    const st = db.students.find((x) => x.id === id)!;
-    return todaySessionsFor(db, id).map(({ x, makeup }) => {
-      const a = db.attendances.find((y) => y.session_id === x.id && y.student_id === id);
-      return { studentId: id, name: st.name, grade: st.grade, sessionId: x.id, className: db.classes.find((c) => c.id === x.class_id)!.name, start: sessionStart(db, x), checkedAt: a?.checked_at ?? null, makeup };
-    });
+  const st = db.students.find((x) => x.kiosk_code === code);
+  if (!st) return [];
+  return todaySessionsFor(db, st.id).map(({ x, makeup }) => {
+    const a = db.attendances.find((y) => y.session_id === x.id && y.student_id === st.id);
+    return { studentId: st.id, name: st.name, grade: st.grade, sessionId: x.id, className: db.classes.find((c) => c.id === x.class_id)!.name, start: sessionStart(db, x), checkedAt: a?.checked_at ?? null, leftAt: a?.left_at ?? null, makeup };
   });
 }
 
@@ -1051,16 +1144,37 @@ export async function kioskCheckIn(studentId: number, sessionId: number) {
   const now = new Date().toTimeString().slice(0, 5);
   const status = statusByTime(sessionStart(db, sess), now);
   if (a) Object.assign(a, { status, checked_at: now, source: "kiosk" as const });
-  else db.attendances.push({ id: nextId(db.attendances), session_id: sessionId, student_id: studentId, status, checked_at: now, source: "kiosk" });
-  saveDB(db);
+  else db.attendances.push({ id: nextId(db.attendances), session_id: sessionId, student_id: studentId, status, checked_at: now, left_at: null, source: "kiosk" });
   const st = db.students.find((x) => x.id === studentId)!;
-  return { name: st.name, time: now, status, late: status === "late" ? toMin(now) - toMin(sessionStart(db, sess)) : 0, className: db.classes.find((c) => c.id === sess.class_id)!.name };
+  const cls = db.classes.find((c) => c.id === sess.class_id)!;
+  const late = status === "late" ? toMin(now) - toMin(sessionStart(db, sess)) : 0;
+  notify(db, {
+    family_id: st.family_id, student_id: st.id, kind: late ? "late" : "arrive",
+    title: late ? `${st.name.slice(1)} 지각 · ${late}분` : `${st.name.slice(1)} 등원`,
+    body: `${cls.name} ${sessionStart(db, sess)} 수업 · ${now} 등원`, link: "/attendance",
+  });
+  saveDB(db);
+  return { name: st.name, time: now, status, late, className: cls.name, kind: "in" as const };
 }
 
-/* ---------- 수강 등록 (운영이 대신) ----------
- * 고객 앱 수강 신청과 같은 규칙(정원, 이미 수강 중이면 거절). 단 학년이 달라도 등록 가능 (선행·복습은 상담·레벨 테스트 후 학원만),
- * 시작일은 그 강좌의 다음 수업일(시스템이 정함). 접수 경로를 함께 남긴다
- */
+export async function kioskCheckOut(studentId: number, sessionId: number) {
+  await wait();
+  requireStaff();
+  const db = loadDB();
+  const sess = db.class_sessions.find((x) => x.id === sessionId);
+  if (!sess || sess.date !== TODAY) throw new ApiError("오늘 수업이 아니에요.");
+  const a = db.attendances.find((y) => y.session_id === sessionId && y.student_id === studentId);
+  if (!a?.checked_at) throw new ApiError("등원 기록이 없어요. 먼저 등원을 눌러 주세요.");
+  if (a.left_at) throw new ApiError(`이미 ${a.left_at}에 하원했어요.`, 409);
+  const now = new Date().toTimeString().slice(0, 5);
+  a.left_at = now < a.checked_at ? a.checked_at : now;
+  const st = db.students.find((x) => x.id === studentId)!;
+  const cls = db.classes.find((c) => c.id === sess.class_id)!;
+  notify(db, { family_id: st.family_id, student_id: st.id, kind: "leave", title: `${st.name.slice(1)} 하원`, body: `${cls.name} · ${a.left_at} 하원`, link: "/attendance" });
+  saveDB(db);
+  return { name: st.name, time: a.left_at, status: a.status, late: 0, className: cls.name, kind: "out" as const };
+}
+
 export const ENROLL_CHANNELS = ["상담 후 배정", "전화 요청", "방문 요청", "기타"] as const;
 export type EnrollChannel = (typeof ENROLL_CHANNELS)[number];
 
@@ -1111,11 +1225,16 @@ export interface LevelScoreInput {
   type: number;
   advanced: number;
   memo?: string;
+  // 분야별 정답률(%) — 중등 시험만. 비우면 null
+  areas?: { number: number | null; change: number | null; shape: number | null; data: number | null };
 }
+export const AREA_LABEL = { number: "수와 연산", change: "변화와 관계", shape: "도형과 측정", data: "자료와 가능성" } as const;
 function checkScores(x: LevelScoreInput) {
   const ok = (v: number, max: number) => Number.isInteger(v) && v >= 0 && v <= max;
   if (!ok(x.concept, LEVEL_MAX.concept) || !ok(x.type, LEVEL_MAX.type) || !ok(x.advanced, LEVEL_MAX.advanced))
     throw new ApiError(`점수를 확인해 주세요. 개념 0~${LEVEL_MAX.concept}, 유형 0~${LEVEL_MAX.type}, 심화 0~${LEVEL_MAX.advanced}점이에요.`);
+  const ar = x.areas;
+  if (ar && Object.values(ar).some((v) => v !== null && !ok(v, 100))) throw new ApiError("분야별 정답률은 0~100%로 넣어 주세요.");
 }
 
 // 점수 → 판정까지 채운 한 줄 (같은 학생·종류·날짜가 있으면 고쳐 쓴다)
@@ -1137,16 +1256,28 @@ function putTest(db: DB, me: Staff, student: Student, kind: LevelTestKind, teste
     advance_ok: kind === "advance" && total >= ADVANCE_PASS,
     staff_id: me.id,
     memo: (x.memo ?? "").trim(),
+    // 분야 정답률은 중등 시험(학년 7~9)만
+    area_number: testGrade <= 9 ? x.areas?.number ?? null : null,
+    area_change: testGrade <= 9 ? x.areas?.change ?? null : null,
+    area_shape: testGrade <= 9 ? x.areas?.shape ?? null : null,
+    area_data: testGrade <= 9 ? x.areas?.data ?? null : null,
   };
   const old = db.level_tests.find((t) => t.student_id === student.id && t.kind === kind && t.tested_on === testedOn);
   const label = `${LEVEL_TEST_KIND_LABEL[kind]} 레벨테스트 ${md(testedOn)}`;
   if (old) {
-    if (old.total_score === total && old.concept_score === x.concept && old.type_score === x.type && old.memo === row.memo) return;
+    if (JSON.stringify({ ...old, id: 0, staff_id: 0 }) === JSON.stringify({ ...row, id: 0, staff_id: 0 })) return;
     addLog(db, me, student.id, "level_test", "update", `${label} 수정: ${old.total_score}점(${old.result_level}) → ${total}점(${row.result_level})`);
     Object.assign(old, row);
   } else {
     db.level_tests.push({ id: nextId(db.level_tests), ...row });
     addLog(db, me, student.id, "level_test", "create", `${label}: ${total}점 · ${row.result_level}${kind === "advance" ? (row.advance_ok ? " · 선행 통과" : " · 선행 미통과") : ""}`);
+    // 새 결과 → 학부모 알림
+    notify(db, {
+      family_id: student.family_id, student_id: student.id, kind: "level_test",
+      title: `${student.name.slice(1)} 레벨테스트 결과가 나왔어요`,
+      body: `${md(testedOn)} ${LEVEL_TEST_KIND_LABEL[kind]} 테스트 · ${kind === "advance" ? (row.advance_ok ? "선행 통과" : "선행 미통과") : row.result_level}`,
+      link: `/me/child/${student.id}`,
+    });
   }
 }
 
@@ -1198,7 +1329,7 @@ export async function getLevelTestSheet(classId: number, testedOn: string) {
         .sort((a, b) => b.tested_on.localeCompare(a.tested_on))[0];
       return { student: s, test: t ? viewTest(t) : null, previous: prev ? { tested_on: prev.tested_on, total_score: prev.total_score, result_level: prev.result_level } : null };
     });
-  return { cls: { id: cls.id, name: cls.name, level: cls.level }, testedOn, rows };
+  return { cls: { id: cls.id, name: cls.name, level: cls.level, target_grade: cls.target_grade }, testedOn, rows };
 }
 
 export async function saveLevelTestSheet(classId: number, testedOn: string, entries: (LevelScoreInput & { studentId: number })[]) {
@@ -1222,3 +1353,43 @@ export async function saveLevelTestSheet(classId: number, testedOn: string, entr
   return { saved: entries.length };
 }
 
+
+
+// 강사 코멘트 초안 (AI). 저장하지 않고 글만 돌려준다 → 강사가 고쳐서 저장
+export async function draftLevelComment(input: LevelScoreInput & { kind: LevelTestKind; studentId: number }) {
+  await wait();
+  const me = requireStaff();
+  const db = loadDB();
+  const s = db.students.find((x) => x.id === input.studentId);
+  if (!s) throw new ApiError("없는 학생이에요.", 404);
+  if (!canEditStudentTests(db, me, s.id)) throw new ApiError("담당 강좌 학생만 입력할 수 있어요.", 403);
+  checkScores(input);
+  const testGrade = (input.kind === "advance" ? s.grade + 1 : s.grade) as Grade;
+  const ar = input.areas;
+  const areas = testGrade <= 9 && ar ? (Object.keys(AREA_LABEL) as (keyof typeof AREA_LABEL)[]).filter((k) => ar[k] !== null).map((k) => ({ label: AREA_LABEL[k], value: ar[k]! })) : [];
+  return draftComment({ grade: GRADE_LABEL[testGrade], kind: LEVEL_TEST_KIND_LABEL[input.kind], level: judgeLevel(input.concept, input.type, input.advanced), concept: input.concept, type: input.type, advanced: input.advanced, areas });
+}
+
+/* ---------- 미납 알림 ---------- */
+// 수납 화면 [미납 알림 보내기]: 그 달 미납이 있는 가족마다 알림 하나 (자녀·강좌를 묶어서)
+export async function sendUnpaidNotices(month: string) {
+  await wait();
+  const me = requireManager();
+  const db = loadDB();
+  const byFamily = new Map<number, { names: string[]; total: number }>();
+  for (const s of db.students) {
+    const rows = paymentRows(db, s, month).filter((p) => p.status === "unpaid");
+    if (!rows.length) continue;
+    const f = byFamily.get(s.family_id) ?? { names: [], total: 0 };
+    rows.forEach((r) => f.names.push(`${s.name.slice(1)} ${r.className}`));
+    f.total += rows.reduce((t, r) => t + r.amount, 0);
+    byFamily.set(s.family_id, f);
+  }
+  const m = Number(month.slice(5));
+  byFamily.forEach((f, familyId) =>
+    notify(db, { family_id: familyId, student_id: null, kind: "unpaid", title: `${m}월 수강료 ${f.total.toLocaleString("ko-KR")}원이 아직 납부되지 않았어요`, body: f.names.join(", "), link: "/payments" }),
+  );
+  if (byFamily.size) addLog(db, me, null, "payment", "create", `${m}월 미납 알림 보냄: ${byFamily.size}가족`);
+  saveDB(db);
+  return { families: byFamily.size };
+}

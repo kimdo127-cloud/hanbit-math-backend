@@ -1,6 +1,6 @@
 import { compareSync, hashSync } from "bcryptjs";
 // 빈 화면을 보지 않게 넣는 가상 데이터. 나중에 백엔드 시드 SQL로 옮긴다.
-import type { ActivityLog, AttendanceStatus, ClassLevel, DB, Grade } from "./types";
+import type { ActivityLog, AppNotification, AttendanceStatus, ClassLevel, DB, Grade } from "./types";
 import { judgeLevel } from "./level";
 import { addHours, hashInviteCode, INVITE_HOURS, newInviteCode } from "./invite";
 
@@ -69,6 +69,7 @@ export function createSeed(): DB {
     staff_tokens: [],
     level_tests: [],
     invitations: [],
+    notifications: [],
   };
 
   // 직원
@@ -113,8 +114,8 @@ export function createSeed(): DB {
   db.families.push({ id: 1, name: "김서준·김하린 가족" });
   db.parents.push({ id: 1, family_id: 1, email: "demo@hanbit.kr", password_hash: mockHash("hanbit1234"), name: "김민정", created_at: "2026-08-20" });
   db.students.push(
-    { id: 1, family_id: 1, name: "김서준", grade: 8, school: "한빛중학교", birth_date: "2012-04-11" },
-    { id: 2, family_id: 1, name: "김하린", grade: 7, school: "한빛중학교", birth_date: "2013-09-02" },
+    { id: 1, family_id: 1, name: "김서준", grade: 8, school: "한빛중학교", birth_date: "2012-04-11", kiosk_code: "2580" },
+    { id: 2, family_id: 1, name: "김하린", grade: 7, school: "한빛중학교", birth_date: "2013-09-02", kiosk_code: "1357" },
   );
   // 연락처는 가족 단위 (서준·하린 남매가 같은 번호를 공유). 대표 = 초대 문자를 받는 번호
   db.family_contacts.push(
@@ -134,7 +135,7 @@ export function createSeed(): DB {
   classDefs.forEach(([, grade, , , , , fill], i) => {
     for (let k = 0; k < fill; k++) {
       db.families.push({ id: familyId, name: `${FILLER_NAMES[nameIdx % FILLER_NAMES.length]} 가족` });
-      db.students.push({ id: studentId, family_id: familyId, name: FILLER_NAMES[nameIdx % FILLER_NAMES.length], grade, school: "한빛중학교", birth_date: "2012-01-01" });
+      db.students.push({ id: studentId, family_id: familyId, name: FILLER_NAMES[nameIdx % FILLER_NAMES.length], grade, school: "한빛중학교", birth_date: "2012-01-01", kiosk_code: String(3000 + studentId * 17) });
       db.enrollments.push({ id: enrollId++, student_id: studentId, class_id: i + 1, start_date: "2026-09-01", end_date: null, refund_amount: null, refunded_at: null });
       // 보호자 연락처 (키오스크에서 뒷자리 4자리로 찾음)
       db.family_contacts.push({ id: db.family_contacts.length + 1, family_id: familyId, relation: k % 2 ? "아빠" : "엄마", phone: `010-${2000 + studentId * 13}-${String(1000 + ((studentId * 379) % 9000)).padStart(4, "0")}`, is_primary: true });
@@ -151,7 +152,7 @@ export function createSeed(): DB {
   Object.assign(g2, { end_date: "2026-10-05", refund_amount: 186660, refunded_at: "2026-10-08" });
   // 운영 시연: 학년이 다른 강좌 수강(선행) — 중1 학생이 중2 금요 보충
   db.families.push({ id: familyId, name: "윤채원 가족" });
-  db.students.push({ id: studentId, family_id: familyId, name: "윤채원", grade: 7, school: "한빛중학교", birth_date: "2013-03-02" });
+  db.students.push({ id: studentId, family_id: familyId, name: "윤채원", grade: 7, school: "한빛중학교", birth_date: "2013-03-02", kiosk_code: "7788" });
   db.enrollments.push({ id: enrollId++, student_id: studentId, class_id: 7, start_date: "2026-10-02", end_date: null, refund_amount: null, refunded_at: null });
   db.family_contacts.push({ id: db.family_contacts.length + 1, family_id: familyId, relation: "엄마", phone: "010-4455-7788", is_primary: true });
   // 초대 시연: 김씨네는 가입 완료, 윤채원 가족은 초대 발급(유효), 이도윤 가족은 초대 만료 → 어드민에서 다시 보내기
@@ -193,7 +194,12 @@ export function createSeed(): DB {
         const t = h * 60 + m + off;
         const checked_at = status === "absent" ? null : `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
         // 등원은 키오스크(학생이 직접), 결석은 강사가 확인해 처리
-        db.attendances.push({ id: attId++, session_id: s.id, student_id: en.student_id, status, checked_at, source: status === "absent" ? "staff" : "kiosk" });
+        // 하원: 지난 수업은 끝나는 시각 무렵에 찍었다고 둔다 (오늘 수업은 아직 수업 중)
+        const end = db.class_schedules.find((c) => c.class_id === s.class_id && c.weekday === wd)!.end_time;
+        const [eh, em] = end.split(":").map(Number);
+        const lt = eh * 60 + em + ((en.student_id + idx) % 9);
+        const left_at = checked_at && s.date < TODAY ? `${String(Math.floor(lt / 60)).padStart(2, "0")}:${String(lt % 60).padStart(2, "0")}` : null;
+        db.attendances.push({ id: attId++, session_id: s.id, student_id: en.student_id, status, checked_at, left_at, source: status === "absent" ? "staff" : "kiosk" });
       });
   });
 
@@ -225,17 +231,25 @@ export function createSeed(): DB {
 
   // 레벨테스트 시연: 입학 테스트(8/20, 한실장 입력) — 반 레벨에 맞춘 점수. 정기 테스트는 2월·8월 셋째 토요일
   // 서준: 심화 판정인데 기본반을 다님 → 심화반 추천(마감) / 하린: 최상위 + 선행 테스트 통과 → 선행 상담 대상
-  const addTest = (studentId: number, kind: "regular" | "entry" | "advance", tested_on: string, grade: number, c: number, t: number, a: number, staff_id: number, memo = "") => {
+  // 분야별 정답률(중등만): 점수 비율을 기준으로 학생마다 조금씩 다르게
+  const areas = (grade: number, total: number, seed: number) => {
+    if (grade > 9) return { area_number: null, area_change: null, area_shape: null, area_data: null };
+    const v = (k: number) => Math.max(0, Math.min(100, total + (((seed * k) % 31) - 15)));
+    return { area_number: v(7), area_change: v(11), area_shape: v(13), area_data: v(17) };
+  };
+  const addTest = (studentId: number, kind: "regular" | "entry" | "advance", tested_on: string, grade: number, c: number, t: number, a: number, staff_id: number, memo = "", fixed?: [number, number, number, number]) => {
     const total = c + t + a;
     db.level_tests.push({
       id: db.level_tests.length + 1, student_id: studentId, kind, tested_on, test_grade: grade as Grade,
       concept_score: c, type_score: t, advanced_score: a, total_score: total, result_level: judgeLevel(c, t, a),
       advance_ok: kind === "advance" && total >= 70, staff_id, memo,
+      ...(fixed ? { area_number: fixed[0], area_change: fixed[1], area_shape: fixed[2], area_data: fixed[3] } : areas(grade, total, studentId + tested_on.length)),
     });
   };
-  addTest(1, "entry", "2026-08-20", 8, 30, 32, 14, 5, "개념은 탄탄함. 서술형 풀이 연습 필요");
-  addTest(2, "entry", "2026-08-20", 7, 36, 38, 17, 5, "계산 실수 거의 없음");
-  addTest(2, "advance", "2026-10-17", 8, 31, 30, 13, 2, "중2 1단원 선행 테스트");
+  // 서준: 입학 테스트 1건 / 하린: 입학 + 선행 테스트
+  addTest(1, "entry", "2026-08-20", 8, 30, 32, 14, 5, "개념은 탄탄해요. 도형 서술형 풀이를 더 연습하면 좋아요.", [82, 78, 58, 74]);
+  addTest(2, "entry", "2026-08-20", 7, 36, 38, 17, 5, "계산 실수가 거의 없어요. 지금처럼 꾸준히 하면 돼요.", [96, 90, 88, 92]);
+  addTest(2, "advance", "2026-10-17", 8, 31, 30, 13, 2, "중2 1단원 선행 테스트를 통과했어요.", [80, 72, 70, 76]);
   db.students.filter((st) => st.id > 2).forEach((st) => {
     const en = db.enrollments.find((e) => e.student_id === st.id)!;
     const lv = db.classes.find((c) => c.id === en.class_id)!.level;
@@ -243,6 +257,15 @@ export function createSeed(): DB {
     const [c, t, a] = lv === "심화" ? [26 + r(3), 26 + r(5), 10 + r(2)] : [17 + r(3) * 2, 18 + r(5) * 2, 4 + r(2)];
     addTest(st.id, "entry", en.start_date === "2026-09-01" ? "2026-08-20" : "2026-09-26", st.grade, c, t, a, 5);
   });
+
+  // 알림 시연 (김씨네): 지난 것은 읽음, 최근 것은 안 읽음
+  const note = (created_at: string, student_id: number, kind: AppNotification["kind"], title: string, body: string, link: string, read: boolean) =>
+    db.notifications.push({ id: db.notifications.length + 1, family_id: 1, student_id, kind, title, body, link, created_at, read_at: read ? created_at : null });
+  note("2026-10-17T18:20", 2, "level_test", "하린 레벨테스트 결과가 나왔어요", "10/17 선행 테스트 74점 · 선행 통과", "/me/child/2", true);
+  note("2026-10-20T19:30", 1, "absent", "서준 결석", "10/20(화) 중2 내신 대비 수업에 오지 않았어요. 보강을 신청할 수 있어요.", "/makeup", true);
+  note("2026-10-22T17:11", 1, "late", "서준 지각 · 11분", "중2 내신 대비 17:00 수업 · 17:11 등원", "/attendance", true);
+  note("2026-10-27T19:04", 1, "leave", "서준 하원", "중2 내신 대비 · 19:04 하원", "/attendance", false);
+  note("2026-10-29T16:50", 1, "arrive", "서준 등원", "중2 내신 대비 17:00 수업 · 16:50 등원", "/attendance", false);
 
   // 변경 이력 시연: 수강 등록·보강 신청·수강 중단·환불 기록
   const log = (at: string, actor_type: "parent" | "staff", actor_id: number, actor_name: string, student_id: number | null, entity: ActivityLog["entity"], action: ActivityLog["action"], summary: string) =>

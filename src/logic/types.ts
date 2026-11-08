@@ -25,6 +25,7 @@ export interface Student {
   grade: Grade;
   school: string;
   birth_date: string; // 형제 순서(둘째 할인) 기준
+  kiosk_code: string; // 출석 번호 4자리. 등록할 때 학생이 정하고 학원이 입력. 학생마다 하나 (UNIQUE)
 }
 
 // 보호자 연락처: 가족 단위로 한 번만 저장 (형제가 같은 번호를 공유 → 원천은 하나)
@@ -116,6 +117,7 @@ export interface Attendance {
   student_id: number; // UNIQUE(session_id, student_id)
   status: AttendanceStatus;
   checked_at: string | null; // 등원 시각 "HH:MM" (결석이면 null). 지각 여부는 강좌 시작 시각과 비교
+  left_at: string | null; // 하원 시각 "HH:MM" (키오스크에서 하원을 누른 시각)
   source: "kiosk" | "staff"; // 기록 방법: 입구 키오스크(학생이 직접) · 강사(결석 처리·수정)
 }
 
@@ -151,7 +153,26 @@ export interface LevelTest {
   result_level: ClassLevel; // 판정 레벨 (백엔드가 점수로 계산)
   advance_ok: boolean; // 선행 가능 (선행 테스트 70점 이상일 때만 true)
   staff_id: number; // 입력한 직원
-  memo: string;
+  memo: string; // 강사 코멘트. 학부모 앱에 보인다
+  // 분야별 정답률 (%) — 중학 교육과정 4영역. 반 판정에는 쓰지 않고 약한 분야를 알려 주는 데만 쓴다. 고등 시험은 비움
+  area_number: number | null; // 수와 연산
+  area_change: number | null; // 변화와 관계
+  area_shape: number | null; // 도형과 측정
+  area_data: number | null; // 자료와 가능성
+}
+
+// 학부모 알림 (알림함). 같은 내용을 앱 푸시로도 보낸다. 지우지 않고 쌓는다
+export type NotificationKind = "arrive" | "late" | "leave" | "absent" | "level_test" | "makeup" | "unpaid";
+export interface AppNotification {
+  id: number;
+  family_id: number;
+  student_id: number | null;
+  kind: NotificationKind;
+  title: string;
+  body: string;
+  link: string; // 누르면 갈 학부모 앱 주소
+  created_at: string; // "2026-10-29T16:50"
+  read_at: string | null;
 }
 
 // 변경 이력: 누가(고객/직원) · 언제 · 무엇을 · 어떻게 바꿨는지. 지우지 않고 쌓기만 한다
@@ -186,4 +207,5 @@ export interface DB {
   staff_tokens: StaffToken[];
   level_tests: LevelTest[];
   invitations: Invitation[];
+  notifications: AppNotification[];
 }

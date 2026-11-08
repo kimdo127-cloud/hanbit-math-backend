@@ -665,11 +665,14 @@ export async function getLevelTests(studentId: number) {
   const s = requireOwnStudent(studentId);
   const db = loadDB();
   const latest = latestPlacement(db, s.id);
+  // 맞는 반: 챗봇과 같은 추천 규칙 (같은 학년 · 최근 판정과 같은 레벨 · 지금 다니지 않는 반)
+  const rec = recommendClasses(db, s, TODAY);
   return {
     tests: db.level_tests.filter((t) => t.student_id === s.id).sort((a, b) => b.tested_on.localeCompare(a.tested_on) || b.id - a.id).map(viewTest),
     latest: latest ? viewTest(latest) : null,
     canAdvance: canAdvance(db, s.id),
     nextRegular: nextRegularTest(TODAY),
+    recommend: rec.items.map((r) => ({ classId: r.cls.id, name: r.cls.name, seatsLeft: r.seatsLeft, overlap: r.overlap })),
   };
 }
 
@@ -690,7 +693,7 @@ export async function getLevelTestDates(month: string) {
 /* ---------- 챗봇에 넘기는 가족 메모 (family_info) ---------- */
 // 백엔드가 질문마다 새로 만든다. Dify는 이 메모와 규정 문서만 보고 답한다 (DB에 직접 접근하지 않음)
 // 담는 것: 로그인한 가족의 자녀별 반·다음 수업·이번 달 출결·보강·수강료·최근 레벨테스트·추천 반
-// 담지 않는 것: 다른 가족, 연락처, 이메일, 비밀번호, 강사 메모
+// 담지 않는 것: 다른 가족, 연락처, 이메일, 비밀번호
 const WD = ["일", "월", "화", "수", "목", "금", "토"];
 const won = (n: number) => `${n.toLocaleString("ko-KR")}원`;
 
@@ -736,6 +739,17 @@ export function familyInfoText(): string {
         ? `- 최근 레벨테스트: ${md(t.tested_on)} ${LEVEL_TEST_KIND_LABEL[t.kind]} · ${t.total_score}점(개념 ${t.concept_score}/40 · 유형 ${t.type_score}/40 · 심화 ${t.advanced_score}/20) · 판정 ${t.result_level}`
         : "- 최근 레벨테스트: 기록 없음 (반 추천은 레벨테스트 후 가능)",
     );
+    if (t) {
+      const prev = db.level_tests.filter((x) => x.student_id === k.id && x.kind !== "advance" && x.tested_on < t.tested_on).sort((a, b) => b.tested_on.localeCompare(a.tested_on))[0];
+      if (prev) lines.push(`- 지난 테스트 대비: ${md(prev.tested_on)} ${prev.total_score}점(${prev.result_level}) → ${t.total_score}점(${t.result_level}), ${t.total_score - prev.total_score >= 0 ? "+" : ""}${t.total_score - prev.total_score}점`);
+      const areas = [["수와 연산", t.area_number], ["변화와 관계", t.area_change], ["도형과 측정", t.area_shape], ["자료와 가능성", t.area_data]].filter((a): a is [string, number] => a[1] !== null);
+      if (areas.length) {
+        const weak = [...areas].sort((a, b) => a[1] - b[1])[0];
+        lines.push(`- 분야별 정답률: ${areas.map(([l, v]) => `${l} ${v}%`).join(", ")} · 가장 약한 분야: ${weak[0]}`);
+      }
+      if (t.memo) lines.push(`- 선생님 코멘트: ${t.memo}`);
+    }
+    lines.push(`- 다음 정기 레벨테스트: ${md(nextRegularTest(TODAY))}(토)`);
     const adv = latestAdvance(db, k.id);
     if (adv) lines.push(`- 선행 테스트: ${md(adv.tested_on)} ${adv.total_score}점 · ${adv.advance_ok ? "통과" : "미통과"}`);
     if (t) {
@@ -751,4 +765,36 @@ export function familyInfoText(): string {
     }
   }
   return lines.join("\n");
+}
+
+
+/* ---------- 알림함 · 앱 푸시 ---------- */
+// 알림은 가족 단위로 쌓인다 (등원·지각·하원·결석, 레벨테스트 결과, 보강 확정, 미납). 지우지 않고 읽음만 표시
+
+export async function listNotifications() {
+  await wait();
+  const parent = requireParent();
+  const db = loadDB();
+  return db.notifications.filter((n) => n.family_id === parent.family_id).sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id).slice(0, 100);
+}
+
+export async function getUnreadCount() {
+  await wait();
+  const parent = requireParent();
+  return loadDB().notifications.filter((n) => n.family_id === parent.family_id && !n.read_at).length;
+}
+
+// 알림함을 열면 모두 읽음
+export async function markNotificationsRead() {
+  await wait();
+  const parent = requireParent();
+  const db = loadDB();
+  const at = `${TODAY}T${new Date().toTimeString().slice(0, 5)}`;
+  db.notifications.filter((n) => n.family_id === parent.family_id && !n.read_at).forEach((n) => (n.read_at = at));
+  saveDB(db);
+}
+
+// 웹 푸시 공개키 (브라우저가 구독할 때 쓴다). 서버에 키가 없으면 null → 화면은 알림함만 보여 준다
+export function getPushKey() {
+  return process.env.VAPID_PUBLIC_KEY || null;
 }

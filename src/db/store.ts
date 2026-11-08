@@ -49,9 +49,13 @@ export async function runRequest<T>(who: { parentId: number | null; staffId: num
       const db = await loadAll(client);
       const c: Ctx = { db, snapshot: JSON.stringify(db), dirty: false, ...who };
       const result = await als.run(c, fn);
-      if (c.dirty) await syncChanges(client, JSON.parse(c.snapshot) as DB, c.db);
+      const before = JSON.parse(c.snapshot) as DB;
+      if (c.dirty) await syncChanges(client, before, c.db);
       await client.query("COMMIT");
-      return { result, parentId: c.parentId, staffId: c.staffId };
+      // 이번 요청에서 새로 생긴 알림 → 커밋 뒤 앱 푸시로 보낸다 (api.controller)
+      const oldIds = new Set(before.notifications.map((n) => n.id));
+      const notifications = c.dirty ? c.db.notifications.filter((n) => !oldIds.has(n.id)) : [];
+      return { result, parentId: c.parentId, staffId: c.staffId, notifications };
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
       // 동시에 같은 줄을 바꿔 충돌 → 처음부터 다시 (최대 3번)
