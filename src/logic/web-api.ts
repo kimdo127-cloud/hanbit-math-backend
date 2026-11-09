@@ -14,7 +14,7 @@ import {
 } from "./calc";
 import { checkPw, mockHash, TODAY } from "./seed";
 import { hashInviteCode } from "./invite";
-import { canAdvance, latestAdvance, latestPlacement, LEVEL_TEST_KIND_LABEL, nextRegularTest, recommendClasses, regularTestDates, upcomingRegularTest } from "./level";
+import { alternativeClasses, canAdvance, latestAdvance, latestPlacement, LEVEL_TEST_KIND_LABEL, nextRegularTest, recommendClasses, regularTestDates, upcomingRegularTest } from "./level";
 import { getSessionParentId, loadDB, nextId, saveDB, setSessionParentId } from "../db/store";
 import type { ActivityLog, ClassRoom, DB, ClassSchedule, Enrollment, FamilyContact, Grade, LevelTest, Parent, Student } from "./types";
 
@@ -756,11 +756,29 @@ export function familyInfoText(): string {
       const rec = recommendClasses(db, k, TODAY);
       const ok = rec.items.filter((r) => r.seatsLeft > 0 && !r.overlap);
       const other = rec.items.filter((r) => !(r.seatsLeft > 0 && !r.overlap));
-      lines.push(
-        `- 추천 반(같은 학년 · ${rec.level}): ${ok.length ? ok.map((r) => `${r.cls.name} 자리 ${r.seatsLeft}`).join(", ") : "지금 신청 가능한 반 없음"}${
-          other.length ? ` / 참고: ${other.map((r) => `${r.cls.name}(${r.seatsLeft === 0 ? "마감" : "지금 시간표와 겹침"})`).join(", ")}` : ""
-        }`,
-      );
+      const when = (c: { id: number }) => {
+        const sch = db.class_schedules.filter((x) => x.class_id === c.id).sort((a, b) => a.weekday - b.weekday);
+        return `${sch.map((x) => WD[x.weekday]).join("·")} ${sch[0]?.start_time ?? ""}`;
+      };
+      if (!rec.items.length) {
+        lines.push(`- 추천 반(같은 학년 · ${rec.level}): 이 학년에는 ${rec.level} 수준 반이 없음 (상담으로 안내)`);
+      } else {
+        lines.push(
+          `- 추천 반(같은 학년 · ${rec.level}, 최근 레벨테스트 기준): ${[
+            ...ok.map((r) => `${r.cls.name} ${when(r.cls)} 자리 ${r.seatsLeft}(지금 신청 가능)`),
+            ...other.map((r) => `${r.cls.name} ${when(r.cls)}(${r.seatsLeft === 0 ? "지금 정원 마감" : "지금 시간표와 겹침"})`),
+          ].join(", ")}`,
+        );
+      }
+      if (!ok.length) {
+        const alt = alternativeClasses(db, k, TODAY, new Set(rec.items.map((r) => r.cls.id)));
+        lines.push(
+          `- 대안 반(추천 반이 마감이거나 시간이 겹쳐서, 같은 학년에서 지금 신청 가능한 반): ${
+            alt.length ? alt.map((r) => `${r.cls.name}(${r.cls.level}) ${when(r.cls)} 자리 ${r.seatsLeft}`).join(", ") : "없음"
+          }`,
+        );
+        lines.push("- 반 추천 안내 순서: 추천 반 이름을 먼저 알려 주고, 마감이면 그 사실과 대안 반을 함께 안내. 추천 반 자리는 상담으로 문의");
+      }
       if (canAdvance(db, k.id)) lines.push("- 선행반: 상담 대상 (선행은 앱 신청 불가, 상담 후 학원이 신청)");
     }
   }

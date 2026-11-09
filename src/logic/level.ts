@@ -77,3 +77,13 @@ export function recommendClasses(db: DB, student: Student, today: string): { lev
     .sort((a, b) => Number(a.overlap) - Number(b.overlap) || b.seatsLeft - a.seatsLeft);
   return { level: t.result_level, items };
 }
+
+// 추천 반이 모두 마감이거나 시간이 겹칠 때 안내할 대안 반: 같은 학년 · 지금 자리 있음 · 시간 안 겹침 · 이미 듣는 반과 추천 반 제외
+export function alternativeClasses(db: DB, student: Student, today: string, exclude: Set<number>): ClassRecommendation[] {
+  const enrolled = new Set(db.enrollments.filter((e) => e.student_id === student.id && (e.end_date === null || e.end_date > today)).map((e) => e.class_id));
+  return db.classes
+    .filter((c) => c.target_grade === student.grade && !enrolled.has(c.id) && !exclude.has(c.id))
+    .map((c) => ({ cls: c, seatsLeft: Math.max(0, c.capacity - activeCount(db, c.id, today)), overlap: overlaps(db, student.id, c, today) }))
+    .filter((r) => r.seatsLeft > 0 && !r.overlap)
+    .sort((a, b) => b.seatsLeft - a.seatsLeft);
+}
