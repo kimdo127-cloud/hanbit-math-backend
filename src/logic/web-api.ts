@@ -673,6 +673,10 @@ export async function getLevelTests(studentId: number) {
     canAdvance: canAdvance(db, s.id),
     nextRegular: nextRegularTest(TODAY),
     recommend: rec.items.map((r) => ({ classId: r.cls.id, name: r.cls.name, seatsLeft: r.seatsLeft, overlap: r.overlap })),
+    // 맞는 반이 모두 마감이거나 시간이 겹치면, 같은 학년에서 지금 신청 가능한 반 (챗봇 안내와 같은 규칙)
+    alternatives: rec.items.some((r) => r.seatsLeft > 0 && !r.overlap)
+      ? []
+      : alternativeClasses(db, s, TODAY, new Set(rec.items.map((r) => r.cls.id))).map((r) => ({ classId: r.cls.id, name: r.cls.name, seatsLeft: r.seatsLeft })),
   };
 }
 
@@ -688,6 +692,23 @@ export async function getLevelTestDates(month: string) {
   await wait();
   requireParent();
   return regularTestDates(Number(month.slice(0, 4))).filter((d) => d.startsWith(month));
+}
+
+/* ---------- 챗봇 답에 붙이는 강좌 바로 가기 ---------- */
+// 답에 나온 강좌 이름(학년을 뺀 줄임 이름 포함) 중, 우리 아이 학년이고 지금 자리가 있는 반만 고른다
+// 챗봇 문장을 믿지 않고 DB와 맞춰 고르므로, 마감된 반이나 없는 반으로는 링크가 생기지 않는다
+export function classLinksFor(answer: string): { id: number; name: string; seatsLeft: number }[] {
+  const parent = requireParent();
+  const db = loadDB();
+  const grades = new Set(db.students.filter((s) => s.family_id === parent.family_id).map((s) => s.grade));
+  const enrolled = new Set(
+    db.enrollments.filter((e) => db.students.some((s) => s.id === e.student_id && s.family_id === parent.family_id) && (e.end_date === null || e.end_date > TODAY)).map((e) => e.class_id),
+  );
+  return db.classes
+    .filter((c) => grades.has(c.target_grade) && !enrolled.has(c.id))
+    .filter((c) => answer.includes(c.name) || answer.includes(c.name.replace(/^(중|고)\d\s*/, "")))
+    .map((c) => ({ id: c.id, name: c.name, seatsLeft: Math.max(0, c.capacity - activeCount(db, c.id, TODAY)) }))
+    .filter((c) => c.seatsLeft > 0);
 }
 
 /* ---------- 챗봇에 넘기는 가족 메모 (family_info) ---------- */
